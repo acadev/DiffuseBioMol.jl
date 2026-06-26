@@ -1,0 +1,20 @@
+name = "DiffuseBioMol"
+uuid = "7c602466-83e3-4314-b71d-2956b91f6e9f"
+version = "0.1.0"
+authors = ["acadev <arvindster@gmail.com>"]
+
+[deps]
+BioStructures = "de9282ab-8554-53be-b2d6-f6c222edabfc"
+Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
+NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
+Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
+
+[compat]
+BioStructures = "4.7.1"
+Lux = "1.31.4"
+NNlib = "0.9.36"
+Optimisers = "0.4.7"
+Random = "1.11.0"
+Zygote = "0.7.11"

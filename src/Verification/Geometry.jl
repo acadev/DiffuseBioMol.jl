@@ -1,0 +1,170 @@
+"""
+Pure, differentiable geometric validity checks — no Lux/network dependency,
+just coordinate math — so they can serve double duty as (a) hand-verifiable
+unit-tested functions and (b) a sampling-time guidance potential whose
+gradient w.r.t. coordinates is taken directly with Zygote (Boltz-2's
+"steering potential" precedent, see `docs/PLAN.md` Phase 3).
+
+Approximate ideal bond lengths and van der Waals radii below are standard
+organic-chemistry textbook values, not a real force field — sufficient for a
+v1 differentiable guidance term, not a substitute for MolProbity/OpenMM
+relaxation (Layer 3 in `docs/PLAN.md`'s verification stack, not yet
+implemented).
+"""
+module Geometry
+
+export VDW_RADII, BACKBONE_BOND_LENGTHS
+export clash_energy, bond_energy, validity_energy, lddt
+export clash_count, bond_length_rmsd
+
+const VDW_RADII = Dict{Symbol,Float64}(
+    :C => 1.70, :N => 1.55, :O => 1.52, :S => 1.80, :P => 1.80,
+    :H => 1.10, :Fe => 1.94, :Zn => 1.39, :Mg => 1.73, :Ca => 2.31,
+    :Na => 2.27, :Cl => 1.75, :Mn => 1.97, :Cu => 1.96, :K => 2.75, :Se => 1.90,
+)
+const DEFAULT_VDW_RADIUS = 1.70
+
+vdw_radius(element::Symbol) = get(VDW_RADII, element, DEFAULT_VDW_RADIUS)
+
+"""
+    BACKBONE_BOND_LENGTHS
+
+Approximate ideal protein-backbone bond lengths (Å): intra-residue N-CA,
+CA-C, C-O, CA-CB, and the inter-residue peptide bond C(i)-N(i+1).
+"""
+const BACKBONE_BOND_LENGTHS = Dict(
+    ("N", "CA") => 1.458,
+    ("CA", "C") => 1.525,
+    ("C", "O") => 1.231,
+    ("CA", "CB") => 1.530,
+    "peptide" => 1.329,  # C(i) -> N(i+1)
+)
+
+"""
+    clash_energy(coords, elements, chain_idx, res_index; tol=0.4) -> Real
+
+`coords` is `3 x N`. Sums a smooth repulsive penalty
+`relu(r_vdw_i + r_vdw_j - tol - dist_ij)^2` over atom pairs that are *not*
+excluded as covalently-local (same chain with `|res_index_i - res_index_j| <= 1`,
+i.e. within a residue or its immediate peptide-bonded neighbor — those
+distances are governed by bond/angle constraints, not a free-atom VDW clash
+term). `tol` softens the cutoff slightly below the literal VDW-radius sum,
+since real structures routinely pack atoms a little closer than the textbook
+sum suggests.
+"""
+function clash_energy(coords::AbstractMatrix, elements::AbstractVector{Symbol},
+    chain_idx::AbstractVector, res_index::AbstractVector; tol::Real=0.4)
+    n = size(coords, 2)
+    total = zero(eltype(coords))
+    for i in 1:n, j in (i+1):n
+        excluded = chain_idx[i] == chain_idx[j] && abs(res_index[i] - res_index[j]) <= 1
+        excluded && continue
+        dist = sqrt(sum(abs2, coords[:, i] .- coords[:, j]))
+        threshold = vdw_radius(elements[i]) + vdw_radius(elements[j]) - tol
+        violation = max(threshold - dist, zero(dist))
+        total = total + violation^2
+    end
+    total
+end
+
+"""
+    bond_energy(coords, bonded_pairs) -> Real
+
+`bonded_pairs` is a vector of `(i, j, ideal_length)`. Sums
+`(dist_ij - ideal_length)^2` — a harmonic bond-length restraint.
+"""
+function bond_energy(coords::AbstractMatrix, bonded_pairs::AbstractVector{<:Tuple})
+    total = zero(eltype(coords))
+    for (i, j, ideal) in bonded_pairs
+        dist = sqrt(sum(abs2, coords[:, i] .- coords[:, j]))
+        total = total + (dist - ideal)^2
+    end
+    total
+end
+
+"""
+    clash_count(coords, elements, chain_idx, res_index; tol=0.4) -> Int
+
+The number of atom pairs with a nonzero clash violation (same exclusion rule
+as `clash_energy`) — a more directly interpretable reporting metric for
+benchmarks than the squared-penalty energy ("3 clashing pairs" vs. an
+arbitrary energy unit).
+"""
+function clash_count(coords::AbstractMatrix, elements::AbstractVector{Symbol},
+    chain_idx::AbstractVector, res_index::AbstractVector; tol::Real=0.4)
+    n = size(coords, 2)
+    count = 0
+    for i in 1:n, j in (i+1):n
+        excluded = chain_idx[i] == chain_idx[j] && abs(res_index[i] - res_index[j]) <= 1
+        excluded && continue
+        dist = sqrt(sum(abs2, coords[:, i] .- coords[:, j]))
+        threshold = vdw_radius(elements[i]) + vdw_radius(elements[j]) - tol
+        dist < threshold && (count += 1)
+    end
+    count
+end
+
+"""
+    bond_length_rmsd(coords, bonded_pairs) -> Real
+
+`sqrt(bond_energy(coords, bonded_pairs) / length(bonded_pairs))` — bond
+deviation in Å (the natural unit), rather than `bond_energy`'s squared-error
+sum, for benchmark reporting. Returns `0.0` for an empty bond list.
+"""
+function bond_length_rmsd(coords::AbstractMatrix, bonded_pairs::AbstractVector{<:Tuple})
+    isempty(bonded_pairs) && return zero(eltype(coords))
+    sqrt(bond_energy(coords, bonded_pairs) / length(bonded_pairs))
+end
+
+"""
+    validity_energy(coords, elements, chain_idx, res_index, bonded_pairs;
+                     clash_weight=1.0, bond_weight=1.0, tol=0.4) -> Real
+
+Combined differentiable physical-validity penalty: `clash_weight *
+clash_energy(...) + bond_weight * bond_energy(...)`. This is the function
+whose negative gradient (w.r.t. `coords`) is used as a sampling-time guidance
+correction.
+"""
+function validity_energy(coords::AbstractMatrix, elements::AbstractVector{Symbol},
+    chain_idx::AbstractVector, res_index::AbstractVector, bonded_pairs::AbstractVector{<:Tuple};
+    clash_weight::Real=1.0, bond_weight::Real=1.0, tol::Real=0.4)
+    clash_weight * clash_energy(coords, elements, chain_idx, res_index; tol=tol) +
+        bond_weight * bond_energy(coords, bonded_pairs)
+end
+
+"""
+    lddt(coords_model, coords_ref; cutoff=15.0, thresholds=(0.5, 1.0, 2.0, 4.0)) -> Vector{Float64}
+
+Per-atom local distance difference test (lDDT, as used for AlphaFold-style
+pLDDT confidence labels): for each atom `i`, considers every other atom `j`
+within `cutoff` Å in the *reference* structure, and scores the fraction of
+those `(i, j)` distances that are preserved (within each tolerance in
+`thresholds`) in the model structure, averaged over thresholds. Returns
+values in `[0, 1]`; an atom with no neighbors within `cutoff` scores `1.0`
+(vacuously — there is nothing to get wrong).
+"""
+function lddt(coords_model::AbstractMatrix, coords_ref::AbstractMatrix;
+    cutoff::Real=15.0, thresholds=(0.5, 1.0, 2.0, 4.0))
+    n = size(coords_ref, 2)
+    scores = ones(Float64, n)
+    for i in 1:n
+        neighbors = Int[]
+        for j in 1:n
+            j == i && continue
+            d_ref = sqrt(sum(abs2, coords_ref[:, i] .- coords_ref[:, j]))
+            d_ref <= cutoff && push!(neighbors, j)
+        end
+        isempty(neighbors) && continue
+        preserved = 0.0
+        for j in neighbors
+            d_ref = sqrt(sum(abs2, coords_ref[:, i] .- coords_ref[:, j]))
+            d_model = sqrt(sum(abs2, coords_model[:, i] .- coords_model[:, j]))
+            delta = abs(d_model - d_ref)
+            preserved += count(t -> delta <= t, thresholds) / length(thresholds)
+        end
+        scores[i] = preserved / length(neighbors)
+    end
+    scores
+end
+
+end # module
