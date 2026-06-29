@@ -1,17 +1,32 @@
 """
 Phase 1 hardening, batched: train the Pairformer-lite + DiT flow-matching
-backbone on ~20 real PDB structures using `Model.Batching`'s cross-structure
+backbone on real PDB structures using `Model.Batching`'s cross-structure
 batching, rather than `train_phase1_real_data.jl`'s one-structure-at-a-time
 loop.
 
 Still a small-scale smoke test, not production training — the point is to
-exercise the *batched* real-data path end-to-end (fetch -> tokenize -> batch
--> train -> sample -> validity-check) at least once before trusting it on a
-larger run, since the batched API has so far only been exercised by unit
-tests against tiny synthetic fixtures (see `test/batching_test.jl`) and the
-unbatched path's real-data run (`train_phase1_real_data.jl`).
+exercise the *batched* real-data path end-to-end (load -> tokenize -> batch
+-> train -> sample -> validity-check) before trusting it on a larger run,
+since the batched API has so far only been exercised by unit tests against
+tiny synthetic fixtures (see `test/batching_test.jl`) and the unbatched
+path's real-data run (`train_phase1_real_data.jl`).
 
-Run with: `julia --project=. scripts/train_phase1_batched_real_data.jl`
+Two data sources, chosen by whether `data_dir` is given:
+- **Local directory** (`data_dir` keyword, or the first command-line
+  argument) — the expected mode for a real run against a pre-staged dataset
+  (e.g. a local PDB/PDBBind mirror on a training node), rather than live RCSB
+  fetches every run. Every structure file under `data_dir` (via
+  `Data.list_structure_files`) is restricted to its *largest* chain (via
+  `Data.largest_chain` — local dataset files are often multi-chain with no
+  "the chain we want is A" convention, unlike the curated single-chain
+  RCSB list below), then loaded the same way as the RCSB path.
+- **Built-in RCSB candidate list** (`data_dir=nothing`, the default) — live
+  `fetch_pdb` downloads of a small curated single-chain set, what the
+  CPU smoke test recorded in `docs/PLAN.md` used.
+
+Run with:
+    julia --project=. scripts/train_phase1_batched_real_data.jl                 # RCSB
+    julia --project=. scripts/train_phase1_batched_real_data.jl /path/to/pdbs   # local directory
 """
 
 using DiffuseBioMol
@@ -31,26 +46,73 @@ const N_TARGETS = 20
 const BATCH_SIZE = 4
 const N_EPOCHS = 10
 
-function load_example(pdb_id, chain_id)
-    residues = restrict_to_chain(fetch_pdb(pdb_id), chain_id)
+"""
+    tokenize_example(label, residues) -> NamedTuple
+
+Shared tail of both loading paths: residues (already restricted to one
+chain) -> tokens -> the feature/coordinate bundle `train_on_batch`/sampling
+need. Raises on an empty token list (e.g. a chain that turned out to be pure
+water/heteroatom) so callers can skip-and-continue.
+"""
+function tokenize_example(label::AbstractString, residues)
     tokens = tokenize_structure(residues)
     isempty(tokens) && error("no tokens after parsing/filtering")
     feat = featurize(tokens)
     relpos = relpos_buckets(feat)
     x1 = target_coordinates(tokens)
     cond_features = constraint_features(no_constraints(length(tokens)))
-    (pdb_id=pdb_id, tokens=tokens, feat=feat, relpos=relpos, x1=x1,
+    (pdb_id=label, tokens=tokens, feat=feat, relpos=relpos, x1=x1,
         cond_features=cond_features, n_atoms=length(tokens))
 end
 
-function fetch_targets()
-    examples = typeof(load_example("1CRN", "A"))[]
-    for (id, chain) in CANDIDATE_TARGETS
-        length(examples) >= N_TARGETS && break
+function load_rcsb_example(pdb_id, chain_id)
+    tokenize_example(pdb_id, restrict_to_chain(fetch_pdb(pdb_id), chain_id))
+end
+
+"""
+    load_local_example(path) -> NamedTuple
+
+Parse a structure file from disk and restrict it to its largest chain (see
+the module docstring's "Local directory" note) before tokenizing.
+"""
+function load_local_example(path::AbstractString)
+    residues = parse_structure(path)
+    isempty(residues) && error("no residues parsed")
+    chain = largest_chain(residues)
+    label = splitext(basename(path))[1]
+    tokenize_example(label, restrict_to_chain(residues, chain))
+end
+
+"""
+    load_targets(; data_dir=nothing, n_targets=N_TARGETS, max_atoms=nothing, rng) -> Vector
+
+Loads up to `n_targets` examples, skipping (not aborting on) any individual
+structure that fails to fetch/parse/tokenize, or — if `max_atoms` is given —
+that exceeds it (a local dataset directory can contain much larger
+complexes than the curated RCSB list, and an unbatched-per-structure
+`sample_flow`/validity-check pass over a huge structure later in this script
+could dominate the whole run's wall-clock).
+"""
+function load_targets(; data_dir::Union{Nothing,AbstractString}=nothing, n_targets::Int=N_TARGETS,
+    max_atoms::Union{Nothing,Int}=nothing, rng::AbstractRNG)
+    candidates = if data_dir === nothing
+        CANDIDATE_TARGETS
+    else
+        files = list_structure_files(data_dir)
+        isempty(files) && throw(ArgumentError("no PDB/mmCIF files found under $data_dir"))
+        shuffle(rng, files)
+    end
+
+    loader = data_dir === nothing ? (c -> load_rcsb_example(c...)) : load_local_example
+    examples = []
+    for c in candidates
+        length(examples) >= n_targets && break
         try
-            push!(examples, load_example(id, chain))
+            ex = loader(c)
+            (max_atoms !== nothing && ex.n_atoms > max_atoms) && continue
+            push!(examples, ex)
         catch e
-            println("  skipping $id ($e)")
+            println("  skipping $c ($e)")
         end
     end
     examples
@@ -75,16 +137,19 @@ function train_on_batch(model, ps, st, opt_state, batch, rng)
     (ps, opt_state, loss)
 end
 
-function main(; n_epochs=N_EPOCHS, batch_size=BATCH_SIZE, lr=1.0f-3, seed=0)
+function main(; data_dir::Union{Nothing,AbstractString}=nothing, n_targets=N_TARGETS, max_atoms=nothing,
+    n_epochs=N_EPOCHS, batch_size=BATCH_SIZE, lr=1.0f-3, seed=0)
     rng = Random.Xoshiro(seed)
 
-    println("Fetching and tokenizing real structures (target: $N_TARGETS)...")
-    t_fetch = @elapsed examples = fetch_targets()
+    source = data_dir === nothing ? "RCSB (live fetch)" : "local directory $data_dir"
+    println("Loading and tokenizing real structures from $source (target: $n_targets)...")
+    t_fetch = @elapsed examples = load_targets(; data_dir, n_targets, max_atoms, rng)
     println("got $(length(examples)) structures:")
     for ex in examples
         println("  $(ex.pdb_id): $(ex.n_atoms) atoms")
     end
-    println("fetch+tokenize: $(round(t_fetch; digits=1))s")
+    println("load+tokenize: $(round(t_fetch; digits=1))s")
+    isempty(examples) && error("no structures loaded -- nothing to train on")
     total_atoms = sum(ex.n_atoms for ex in examples)
     println("total atoms across all structures: $total_atoms (mean $(round(total_atoms/length(examples); digits=1)))")
 
@@ -121,5 +186,6 @@ function main(; n_epochs=N_EPOCHS, batch_size=BATCH_SIZE, lr=1.0f-3, seed=0)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    main()
+    data_dir = isempty(ARGS) ? nothing : ARGS[1]
+    main(; data_dir)
 end

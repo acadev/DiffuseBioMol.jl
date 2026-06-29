@@ -2,6 +2,7 @@ using Test
 using DiffuseBioMol
 
 include("pdb_fixtures.jl")
+include("data_local_dataset_test.jl")
 include("augmentation_test.jl")
 include("model_smoke_test.jl")
 include("conditioning_test.jl")

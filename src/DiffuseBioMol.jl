@@ -29,6 +29,7 @@ export AtomVocab, Tokenizer, Data, Model, Sampling, Verification, AgenticLoop, D
 export Modality, PROTEIN, RNA, DNA, LIGAND, ION, PTM, atom_slots
 export AtomToken, ParsedResidue, tokenize_residue, tokenize_structure
 export parse_structure, parse_structure_string, fetch_pdb, restrict_to_chain, from_atom_array
+export list_structure_files, largest_chain
 export TokenFeatures, featurize, relpos_buckets, target_coordinates
 export N_ELEMENTS, N_MODALITIES, N_POLYMER_ATOM_TYPES, N_RELPOS_BUCKETS
 export AtomConstraints, no_constraints, constraint_features, N_COND_FEATURES

@@ -24,6 +24,7 @@ using ..AtomVocab
 using ..Tokenizer: ParsedResidue
 
 export parse_structure, parse_structure_string, fetch_pdb, restrict_to_chain, from_atom_array
+export list_structure_files, largest_chain
 
 # Modified-residue (PTM) 3-letter codes commonly seen in the PDB as HETATM
 # records that are still part of a polymer chain (phosphorylation, methylation,
@@ -143,6 +144,59 @@ structures of different `N` in v1).
 """
 restrict_to_chain(residues::AbstractVector{ParsedResidue}, chain_id::AbstractString) =
     filter(r -> r.chain_id == chain_id, residues)
+
+const STRUCTURE_FILE_EXTENSIONS = (".pdb", ".ent", ".cif", ".mmcif")
+
+"""
+    list_structure_files(dir; recursive=false) -> Vector{String}
+
+Every file under `dir` that `parse_structure`'s path method can read —
+matched by extension (`.pdb`/`.ent`/`.cif`/`.mmcif`, case-insensitive), not
+by trying to parse each one (that stays lazy, at the caller's `parse_structure`
+call, so one malformed file doesn't block listing the rest). Non-recursive by
+default (real local PDB mirrors are sometimes organized into per-entry
+subdirectories — pass `recursive=true` for that layout). Returned in sorted
+(deterministic) order; callers wanting a random subset of a large directory
+should shuffle the result themselves with a seeded RNG, not rely on directory
+listing order.
+"""
+function list_structure_files(dir::AbstractString; recursive::Bool=false)::Vector{String}
+    isdir(dir) || throw(ArgumentError("not a directory: $dir"))
+    files = String[]
+    if recursive
+        for (root, _, fnames) in walkdir(dir)
+            for f in fnames
+                lowercase(splitext(f)[2]) in STRUCTURE_FILE_EXTENSIONS && push!(files, joinpath(root, f))
+            end
+        end
+    else
+        for f in readdir(dir)
+            lowercase(splitext(f)[2]) in STRUCTURE_FILE_EXTENSIONS && push!(files, joinpath(dir, f))
+        end
+    end
+    sort(files)
+end
+
+"""
+    largest_chain(residues) -> String
+
+The `chain_id` with the most residues in `residues`. A local PDB/mmCIF
+dataset directory, unlike a hand-curated single-chain example list, will
+typically contain multi-chain entries with no "the chain we want is A"
+convention — picking the largest chain is a reasonable default for keeping
+the `O(N^2)` pairwise representation tractable (see `restrict_to_chain`'s
+docstring) without requiring per-file chain annotations up front. Callers
+that *do* know which chain they want should call `restrict_to_chain` with
+that id directly instead.
+"""
+function largest_chain(residues::AbstractVector{ParsedResidue})::String
+    isempty(residues) && throw(ArgumentError("no residues to choose a chain from"))
+    counts = Dict{String,Int}()
+    for r in residues
+        counts[r.chain_id] = get(counts, r.chain_id, 0) + 1
+    end
+    argmax(counts)
+end
 
 """
     from_atom_array(chain_id, res_id, res_name, atom_name, element, coord, hetero) -> Vector{ParsedResidue}
