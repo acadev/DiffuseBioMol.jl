@@ -58,8 +58,12 @@ function main(; n_epochs=5, lr=1.0f-3, seed=0)
     println("\nSampling each structure after training:")
     for ex in examples
         x_sample, _ = sample_flow(model, ps, st, ex.feat, ex.relpos, ex.cond_features, rng; n_steps=20)
-        rmse = sqrt(sum(abs2, x_sample .- Float32.(ex.x1)) / length(ex.x1))
-        println("  $(ex.pdb_id): sample RMSE vs. native coords = $(round(rmse; digits=2)) A")
+        # Training's SE(3) augmentation (Sampling.Augmentation) deliberately
+        # randomizes orientation, so an unconditional sample comes out in an
+        # arbitrary frame by design — superpose before comparing (see
+        # Geometry.kabsch_align's docstring), not a raw coordinate difference.
+        rmse = aligned_rmsd(x_sample, Float32.(ex.x1))
+        println("  $(ex.pdb_id): sample RMSD vs. native coords (after superposition) = $(round(rmse; digits=2)) A")
     end
 end
 

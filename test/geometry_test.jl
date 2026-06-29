@@ -1,6 +1,7 @@
 using Test
 using DiffuseBioMol
 using Zygote
+using Random, LinearAlgebra
 
 @testset "Geometry.clash_energy: hand-computed values" begin
     # Two carbons 2.0 A apart, different chains -> not excluded.
@@ -101,4 +102,24 @@ end
     model_isolated = Float64[0.0 1.0 1000.0; 0.0 0.0 0.0; 0.0 0.0 0.0]
     scores = lddt(model_isolated, ref_isolated; cutoff=15.0)
     @test scores[3] == 1.0
+end
+
+@testset "Geometry.aligned_rmsd: zero for a rotated+translated copy of the same shape" begin
+    rng = Random.Xoshiro(99)
+    reference = Float64[0.0 1.5 2.9 5.0; 0.0 0.0 0.4 1.0; 0.0 0.0 0.0 -0.3]
+
+    R, centroid = random_se3_transform(Float32.(reference), trues(4), rng)
+    rotated = apply_se3_transform(Float32.(reference), R, centroid) .+ Float32[100.0, -50.0, 7.0]  # extra arbitrary shift
+
+    @test aligned_rmsd(rotated, reference) < 1e-3
+    # A raw, un-superposed difference would be large for this same pair.
+    @test sqrt(sum(abs2, rotated .- reference) / size(reference, 2)) > 1.0
+end
+
+@testset "Geometry.aligned_rmsd: nonzero for genuinely different shapes" begin
+    reference = Float64[0.0 1.5 2.9 5.0; 0.0 0.0 0.4 1.0; 0.0 0.0 0.0 -0.3]
+    perturbed = copy(reference)
+    perturbed[:, 2] .+= [2.0, 0.0, 0.0]  # move one atom -> genuine shape change
+
+    @test aligned_rmsd(perturbed, reference) > 0.5
 end

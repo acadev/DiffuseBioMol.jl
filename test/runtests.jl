@@ -2,6 +2,7 @@ using Test
 using DiffuseBioMol
 
 include("pdb_fixtures.jl")
+include("augmentation_test.jl")
 include("model_smoke_test.jl")
 include("conditioning_test.jl")
 include("geometry_test.jl")

@@ -13,9 +13,12 @@ implemented).
 """
 module Geometry
 
+using LinearAlgebra: svd, Diagonal, det
+
 export VDW_RADII, BACKBONE_BOND_LENGTHS
 export clash_energy, bond_energy, validity_energy, lddt
 export clash_count, bond_length_rmsd
+export kabsch_align, aligned_rmsd
 
 const VDW_RADII = Dict{Symbol,Float64}(
     :C => 1.70, :N => 1.55, :O => 1.52, :S => 1.80, :P => 1.80,
@@ -165,6 +168,51 @@ function lddt(coords_model::AbstractMatrix, coords_ref::AbstractMatrix;
         scores[i] = preserved / length(neighbors)
     end
     scores
+end
+
+"""
+    kabsch_align(coords, reference) -> Matrix{Float64}  # 3 x N
+
+Rigidly superposes `coords` (`3 x N`) onto `reference` (`3 x N`) via the
+Kabsch algorithm (the optimal least-squares rotation + translation, with a
+reflection correction so the result is never mirrored) and returns the
+superposed `coords`.
+
+Use this — never a raw coordinate-wise difference — when comparing a
+sampled/generated structure against a reference: nothing in this codebase
+guarantees the two share a common global frame. `Sampling.FlowMatching`'s
+training-time SE(3) augmentation (`Sampling.Augmentation`) deliberately
+randomizes the orientation the network is shown, precisely so the network
+isn't forced to memorize the arbitrary frame of any one structure — which
+means a trained model's *unconditional* samples come out in an essentially
+arbitrary frame too, by design, not as a bug. A raw difference conflates
+"wrong rigid pose" with "wrong shape"; superposing first isolates the latter,
+which is what's actually informative.
+"""
+function kabsch_align(coords::AbstractMatrix, reference::AbstractMatrix)
+    centroid_c = vec(sum(coords; dims=2)) ./ size(coords, 2)
+    centroid_r = vec(sum(reference; dims=2)) ./ size(reference, 2)
+    p = Float64.(coords) .- centroid_c
+    q = Float64.(reference) .- centroid_r
+
+    f = svd(p * q')
+    d = sign(det(f.V * f.U'))
+    r = f.V * Diagonal([1.0, 1.0, d]) * f.U'
+    r * p .+ centroid_r
+end
+
+"""
+    aligned_rmsd(coords, reference) -> Real
+
+RMSD between `coords` and `reference` *after* optimal rigid superposition
+(`kabsch_align`) — the standard way to compare two structures' shape
+independent of their relative orientation/position. See `kabsch_align`'s
+docstring for why this, not a raw coordinate-wise RMSE, is the right
+comparison here.
+"""
+function aligned_rmsd(coords::AbstractMatrix, reference::AbstractMatrix)
+    aligned = kabsch_align(coords, reference)
+    sqrt(sum(abs2, aligned .- Float64.(reference)) / size(reference, 2))
 end
 
 end # module

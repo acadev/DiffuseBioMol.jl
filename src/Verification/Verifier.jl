@@ -20,6 +20,15 @@ Each attention block is its own standalone `Lux.@compact` layer, composed via
 (a homogeneous-`Vector`-iterated-at-runtime version of this same pattern hit
 a 47-minute Zygote first-compile time at production scale; `Lux.Chain`'s
 compile-time-recursive composition does not).
+
+**No built-in SE(3) equivariance**, same caveat as `Model.Network`: `coord_in`
+consumes raw coordinates directly. There is no verifier-training script yet
+(`verifier_loss` is currently only exercised by hand-built unit-test
+fixtures), so this isn't compensated for anywhere yet — whichever code
+eventually trains this for real must apply the same centering + random-
+rotation treatment `Sampling.Augmentation`/`Sampling.FlowMatching.prepare_training_example`
+uses for the generator, or the confidence/clash predictions will be just as
+orientation-dependent as the un-augmented generator would have been.
 """
 module Verifier
 

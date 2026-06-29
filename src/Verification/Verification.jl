@@ -34,6 +34,7 @@ using .Verifier
 
 export Geometry, Verifier
 export VDW_RADII, BACKBONE_BOND_LENGTHS, clash_energy, bond_energy, validity_energy, lddt, clash_count, bond_length_rmsd
+export kabsch_align, aligned_rmsd
 export VerifierConfig, build_verifier
 export backbone_bonds, validity_guidance_step, verifier_loss
 

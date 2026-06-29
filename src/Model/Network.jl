@@ -36,6 +36,16 @@ needs explicit masking.
 v1 simplification, noted explicitly: the pair representation is fixed (not
 further updated) once it reaches the decoder. Generalizing that is
 straightforward once needed (see `docs/PLAN.md`, Phase 1 verification gate).
+
+**No built-in SE(3) equivariance**: `coord_in = Dense(3 => d_single)` consumes
+raw Cartesian coordinates with no rotation/translation invariance baked into
+the architecture (no mature Julia equivalent of e3nn exists, see
+`docs/PLAN.md`'s engineering-plan section). This is compensated for at the
+data/training level, not here — see `Sampling.Augmentation`'s module
+docstring and `Sampling.FlowMatching.prepare_training_example`'s use of it.
+Any new caller that feeds this model real coordinates outside that path
+(e.g. a future verifier-training script calling `Verifier.build_verifier`
+directly) needs the same centering + random-rotation treatment.
 """
 module Network
 

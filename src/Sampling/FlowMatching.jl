@@ -15,6 +15,19 @@ optional callbacks rather than by importing `Model.Conditioning` directly —
 `AtomConstraints`/`ChainCoMConstraint` values in `Model.Conditioning` and pass
 the derived arrays/closures in.
 
+**SE(3) augmentation**: `Model.Network` feeds raw coordinates through a plain
+`Dense` layer, with no built-in rotation/translation equivariance (see
+`Augmentation`'s module docstring). `prepare_training_example` therefore
+centers the ground-truth structure on its own centroid and applies a fresh
+random rotation (via `Augmentation.random_se3_transform`/`apply_se3_transform`)
+to every training example, applying the *same* draw to `fixed_coord` so
+motif/hotspot atoms stay geometrically consistent with the rest of the
+structure. `sample_flow` mirrors this at inference time: when `fixed_coord` is
+given, it centers on the fixed atoms' centroid before sampling and adds that
+centroid back to the returned coordinates, so the output is in the caller's
+original frame despite sampling happening in the centered frame the model was
+trained on.
+
 **Two parallel APIs since `docs/PLAN.md`'s batching section**: `Network.build_model`'s
 call convention is now always batched (every tensor carries a trailing `B`
 dimension — see `Network`'s docstring). The single-structure functions below
@@ -30,6 +43,7 @@ module FlowMatching
 
 using Random
 using ..Prior: sample_prior
+using ..Augmentation: random_se3_transform, apply_se3_transform
 
 # `feat` below is a `Model.Features.TokenFeatures` (duck-typed rather than
 # imported, to avoid a cross-module path back into `Model` from `Sampling`;
@@ -78,17 +92,30 @@ constraint set for CFG training).
 rather than generated: they're clamped in `x0` (the flow's start point, not
 just its end point) and excluded from the loss `mask`, so the network is
 never asked to predict a velocity for them.
+
+`x1` (and `fixed_coord`, if given) are centered on the real atoms' centroid
+and rotated by a fresh random rotation before anything else happens — see
+the module docstring's "SE(3) augmentation" note. `fixed_coord` is rotated by
+the *same* draw as `x1` so the two stay geometrically consistent.
 """
 function prepare_training_example(feat, x1::AbstractMatrix, cond_features::AbstractMatrix, rng::AbstractRNG;
     is_fixed::Union{Nothing,BitVector}=nothing, fixed_coord::Union{Nothing,AbstractMatrix}=nothing)
     n = length(feat.element_idx)
     fixed = is_fixed === nothing ? falses(n) : is_fixed
-
-    x0 = Float32.(sample_prior(rng, feat.chain_idx))
-    any(fixed) && (x0[:, fixed] .= Float32.(fixed_coord[:, fixed]))
+    real_atoms = .!feat.is_virtual
 
     x1f = Float32.(x1)
-    mask = .!feat.is_virtual .& .!fixed
+    fixed_coord_t = fixed_coord === nothing ? nothing : Float32.(fixed_coord)
+    if any(real_atoms)
+        R, centroid = random_se3_transform(x1f, real_atoms, rng)
+        x1f = apply_se3_transform(x1f, R, centroid)
+        fixed_coord_t !== nothing && (fixed_coord_t = apply_se3_transform(fixed_coord_t, R, centroid))
+    end
+
+    x0 = Float32.(sample_prior(rng, feat.chain_idx))
+    any(fixed) && (x0[:, fixed] .= fixed_coord_t[:, fixed])
+
+    mask = real_atoms .& .!fixed
     x1f[:, .!mask] .= x0[:, .!mask]  # neutralize: zero target velocity where there's no ground truth (virtual or fixed)
 
     t = rand(rng, Float32)
@@ -167,14 +194,31 @@ sample (`t=0`) to `t=1` in `n_steps` (NeuralPLexer3 reports good results with
 - `post_step(x, t) -> x`: optional callback applied after each step (e.g.
   `Conditioning.apply_com_guidance!`), for guidance terms that aren't
   expressed as a velocity-field blend.
+
+When `is_fixed`/`fixed_coord` are given, sampling happens in the frame
+centered on the fixed atoms' centroid (matching the centering
+`prepare_training_example` applies at training time — see the module
+docstring's "SE(3) augmentation" note), and that centroid is added back to
+the returned coordinates, so the result is in `fixed_coord`'s original frame
+and `x1_hat[:, is_fixed] == fixed_coord[:, is_fixed]` exactly. With no fixed
+atoms (plain unconditional sampling), there is nothing to center on and this
+is a no-op.
 """
 function sample_flow(model, ps, st, feat, relpos_idx::AbstractMatrix, cond_features::AbstractMatrix, rng::AbstractRNG;
     n_steps::Int=40, is_fixed::Union{Nothing,BitVector}=nothing, fixed_coord::Union{Nothing,AbstractMatrix}=nothing,
     cond_features_uncond::Union{Nothing,AbstractMatrix}=nothing, guidance_scale::Real=1.0,
     post_step=nothing)
     n = length(feat.element_idx)
+
+    centroid = zeros(Float32, 3)
+    fixed_coord_c = fixed_coord === nothing ? nothing : Float32.(fixed_coord)
+    if is_fixed !== nothing && any(is_fixed)
+        centroid = vec(sum(view(fixed_coord_c, :, is_fixed); dims=2)) ./ count(is_fixed)
+        fixed_coord_c = fixed_coord_c .- centroid
+    end
+
     x = Float32.(sample_prior(rng, feat.chain_idx))
-    is_fixed !== nothing && (x[:, is_fixed] .= Float32.(fixed_coord[:, is_fixed]))
+    is_fixed !== nothing && (x[:, is_fixed] .= fixed_coord_c[:, is_fixed])
 
     pad_bias = zero_pad_bias(n)
     dt = 1.0f0 / n_steps
@@ -199,10 +243,10 @@ function sample_flow(model, ps, st, feat, relpos_idx::AbstractMatrix, cond_featu
         end
 
         x = x .+ dt .* v
-        is_fixed !== nothing && (x[:, is_fixed] .= Float32.(fixed_coord[:, is_fixed]))
+        is_fixed !== nothing && (x[:, is_fixed] .= fixed_coord_c[:, is_fixed])
         post_step !== nothing && (x = post_step(x, t + dt))
     end
-    (x, st)
+    (x .+ centroid, st)
 end
 
 # --- genuinely-batched API (B > 1) -----------------------------------------
@@ -233,17 +277,33 @@ Batched counterpart of the single-structure `prepare_training_example`.
 are already-batched `3 x N x B`/`N_COND_FEATURES x N x B` arrays (see
 `Model.Batching.batch_coords`/`batch_cond_features`). `batched_feat.pad_mask`
 is folded into the loss mask alongside `is_virtual`/`is_fixed`.
+
+Each batch element gets its own independent centering + random rotation (see
+the module docstring's "SE(3) augmentation" note and the single-structure
+`prepare_training_example` above) — a plain Julia loop over `b` for this is
+fine, same reasoning as `Prior.sample_prior`'s batched form: this isn't
+called inside a `Zygote.pullback` closure.
 """
 function prepare_training_example(batched_feat, x1::AbstractArray{<:Real,3}, cond_features::AbstractArray{<:Real,3},
     rng::AbstractRNG; is_fixed::Union{Nothing,BitMatrix}=nothing, fixed_coord::Union{Nothing,AbstractArray{<:Real,3}}=nothing)
     n, b_size = size(batched_feat.element_idx)
     fixed = is_fixed === nothing ? falses(n, b_size) : is_fixed
-
-    x0 = Float32.(sample_prior(rng, batched_feat.chain_idx))
-    any(fixed) && (x0[:, fixed] .= Float32.(fixed_coord[:, fixed]))
+    real_atoms = batched_feat.pad_mask .& .!batched_feat.is_virtual
 
     x1f = Float32.(x1)
-    mask = batched_feat.pad_mask .& .!batched_feat.is_virtual .& .!fixed
+    fixed_coord_t = fixed_coord === nothing ? nothing : Float32.(fixed_coord)
+    for b in 1:b_size
+        mask_b = view(real_atoms, :, b)
+        any(mask_b) || continue
+        R, centroid = random_se3_transform(view(x1f, :, :, b), mask_b, rng)
+        x1f[:, :, b] .= apply_se3_transform(view(x1f, :, :, b), R, centroid)
+        fixed_coord_t !== nothing && (fixed_coord_t[:, :, b] .= apply_se3_transform(view(fixed_coord_t, :, :, b), R, centroid))
+    end
+
+    x0 = Float32.(sample_prior(rng, batched_feat.chain_idx))
+    any(fixed) && (x0[:, fixed] .= fixed_coord_t[:, fixed])
+
+    mask = real_atoms .& .!fixed
     x1f[:, .!mask] .= x0[:, .!mask]
 
     t = rand(rng, Float32, b_size)

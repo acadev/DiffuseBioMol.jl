@@ -35,10 +35,12 @@ export AtomConstraints, no_constraints, constraint_features, N_COND_FEATURES
 export ChainCoMConstraint, apply_com_guidance!
 export BatchedFeatures, batch_features, batch_relpos, batch_coords, batch_cond_features, attention_pad_bias, to_device
 export ModelConfig, build_model
+export random_rotation, random_se3_transform, apply_se3_transform, random_se3_augment
 export PriorConfig, sample_prior
 export TrainingExample, prepare_training_example, cfm_loss, sample_flow
 export BatchedTrainingExample
 export VDW_RADII, BACKBONE_BOND_LENGTHS, clash_energy, bond_energy, validity_energy, lddt, clash_count, bond_length_rmsd
+export kabsch_align, aligned_rmsd
 export VerifierConfig, build_verifier
 export backbone_bonds, validity_guidance_step, verifier_loss
 
