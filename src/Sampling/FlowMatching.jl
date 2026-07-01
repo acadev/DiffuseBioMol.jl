@@ -335,4 +335,23 @@ function cfm_loss(model, ps, st, batched_feat, relpos_idx::AbstractArray{<:Integ
     (loss, st)
 end
 
+# Extend Model.Batching.to_device so calling to_device(::BatchedTrainingExample, dev)
+# dispatches correctly from the DiffuseBioMol top-level scope — same function object,
+# new method, no export clash with the BatchedFeatures method already there.
+import ...Model.Batching: to_device
+
+"""
+    to_device(example::BatchedTrainingExample, device) -> BatchedTrainingExample
+
+Moves every field to `device` (e.g. `Lux.gpu_device()` or `Lux.cpu_device()`).
+`mask` is converted from `BitMatrix` to dense `Array{Bool}` before transfer for
+the same reason `Model.Batching.to_device` does for `BatchedFeatures`.
+"""
+function to_device(example::BatchedTrainingExample, dev)
+    BatchedTrainingExample(
+        dev(example.x_t), dev(example.t), dev(example.target_v),
+        dev(Array{Bool}(example.mask)), dev(example.cond_features),
+    )
+end
+
 end # module

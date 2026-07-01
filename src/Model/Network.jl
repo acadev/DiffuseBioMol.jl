@@ -160,7 +160,11 @@ flow times in `[0, 1]` (one per batch element, independently sampled — see
 """
 function sinusoidal_embedding(t::AbstractVector{<:Real}, d::Int)
     half = d ÷ 2
-    freqs = exp.(-log(10000.0f0) .* (0:half-1) ./ half)  # half
+    # Float32.(0:half-1) keeps freqs::Vector{Float32} — without the cast,
+    # Float32 .* Int64 silently promotes to Float64, which propagates through
+    # Dense matmuls; harmless on CPU but CUBLAS requires type-homogeneous
+    # inputs and would produce a CuArray{Float64} that mismatches Float32 params.
+    freqs = exp.(-log(10000.0f0) .* Float32.(0:half-1) ./ Float32(half))  # half
     args = reshape(freqs, half, 1) .* reshape(Float32.(t), 1, :)  # half x B
     vcat(sin.(args), cos.(args))  # d x B
 end
