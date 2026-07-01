@@ -52,6 +52,7 @@ module Network
 using Lux
 using NNlib: softmax, gelu, batched_mul, batched_transpose
 using Random
+using ChainRulesCore: @ignore_derivatives
 using ..Features: N_ELEMENTS, N_MODALITIES, N_POLYMER_ATOM_TYPES, N_RELPOS_BUCKETS
 using ..Conditioning: N_COND_FEATURES
 
@@ -161,11 +162,15 @@ flow times in `[0, 1]` (one per batch element, independently sampled — see
 function sinusoidal_embedding(t::AbstractVector{<:Real}, d::Int)
     half = d ÷ 2
     t_f32 = Float32.(t)  # preserves device: CuVector stays CuVector
-    # Allocate freqs on the same device as t so the broadcast .* stays on one device.
-    # similar(..., half) gives an uninitialized vector matching t_f32's array type;
-    # the .= assignment does a CPU→GPU copy when t is on GPU, a plain copy on CPU.
-    freqs = similar(t_f32, half)
-    freqs .= exp.(-log(10000.0f0) .* Float32.(0:half-1) ./ Float32(half))
+    # freqs has zero gradient w.r.t. model params, so @ignore_derivatives is correct.
+    # It also prevents Zygote/IRTools from tracing into CUDA's KernelAbstractions
+    # dispatch (similar → allocate(CUDABackend(),...)) which IRTools cannot lower,
+    # producing IRTools.Inner.Undefined and crashing the backward pass.
+    freqs = @ignore_derivatives begin
+        buf = similar(t_f32, half)
+        copyto!(buf, exp.(-log(10000.0f0) .* Float32.(0:half-1) ./ Float32(half)))
+        buf
+    end
     args = reshape(freqs, half, 1) .* reshape(t_f32, 1, :)  # half x B
     vcat(sin.(args), cos.(args))  # d x B
 end
