@@ -60,6 +60,30 @@ end
     @test size(x_after) == size(x_perturbed)
 end
 
+@testset "chiral_centers: derives CA stereocenters, skips glycine" begin
+    ex = two_residue_fixture()
+    centers = chiral_centers(ex.tokens)
+    # Atom order (see two_residue_fixture): ALA[N,CA,C,O,CB]=1:5, GLY[N,CA,C,O]=6:9.
+    # ALA has a CB -> one center (CA=2, N=1, C=3, CB=5); GLY has none -> no center.
+    @test centers == [(2, 1, 3, 5)]
+end
+
+@testset "validity_guidance_step: also decreases chirality energy when centers are passed" begin
+    ex = two_residue_fixture()
+    bonds = backbone_bonds(ex.tokens)
+    centers = chiral_centers(ex.tokens)
+    elements = [t.element for t in ex.tokens]
+
+    x0 = Float32.(ex.x1)
+    e_before = validity_energy(x0, elements, ex.feat.chain_idx, ex.feat.res_index, bonds, centers)
+
+    post = validity_guidance_step(elements, ex.feat.chain_idx, ex.feat.res_index, bonds, centers; step_size=0.01)
+    x_after = post(x0, 0.5f0)
+    e_after = validity_energy(x_after, elements, ex.feat.chain_idx, ex.feat.res_index, bonds, centers)
+
+    @test e_after < e_before
+end
+
 @testset "build_verifier: output shapes and ranges are correct" begin
     rng = Random.Xoshiro(1)
     ex = two_residue_fixture()
@@ -117,6 +141,7 @@ end
     rng = Random.Xoshiro(5)
     ex = two_residue_fixture()
     bonds = backbone_bonds(ex.tokens)
+    centers = chiral_centers(ex.tokens)
     elements = [t.element for t in ex.tokens]
     n = length(ex.tokens)
     cond_features = constraint_features(no_constraints(n))
@@ -125,13 +150,13 @@ end
     model = build_model(cfg)
     ps, st = DiffuseBioMol.Model.Network.Lux.setup(rng, model)
 
-    post = validity_guidance_step(elements, ex.feat.chain_idx, ex.feat.res_index, bonds; step_size=0.02)
+    post = validity_guidance_step(elements, ex.feat.chain_idx, ex.feat.res_index, bonds, centers; step_size=0.02)
 
     x_guided, _ = sample_flow(model, ps, st, ex.feat, ex.relpos, cond_features, Random.Xoshiro(123); n_steps=20, post_step=post)
     x_unguided, _ = sample_flow(model, ps, st, ex.feat, ex.relpos, cond_features, Random.Xoshiro(123); n_steps=20)
 
     @test all(isfinite, x_guided)
-    e_guided = validity_energy(x_guided, elements, ex.feat.chain_idx, ex.feat.res_index, bonds)
-    e_unguided = validity_energy(x_unguided, elements, ex.feat.chain_idx, ex.feat.res_index, bonds)
+    e_guided = validity_energy(x_guided, elements, ex.feat.chain_idx, ex.feat.res_index, bonds, centers)
+    e_unguided = validity_energy(x_unguided, elements, ex.feat.chain_idx, ex.feat.res_index, bonds, centers)
     @test e_guided < e_unguided
 end

@@ -63,6 +63,68 @@ end
     @test validity_energy(coords, elements, chain_idx, res_index, bonds; clash_weight=0.0) ≈ 0.0
 end
 
+@testset "Geometry.chiral_volume / normalized_chiral_volume / chirality_energy / chirality_count: hand-computed values" begin
+    # Atoms: CA, N, C, CB. N along +x, C along +y, CB along +z from CA at the
+    # origin -> a right-handed, mutually-orthogonal-substituent tetrahedron
+    # (the b1/b2/b3 magnitudes are all 1, so the normalized volume hits its
+    # theoretical max of 1.0 here).
+    coords = Float64[0.0 1.0 0.0 0.0; 0.0 0.0 1.0 0.0; 0.0 0.0 0.0 1.0]
+    @test chiral_volume(coords, 1, 2, 3, 4) ≈ 1.0
+    @test normalized_chiral_volume(coords, 1, 2, 3, 4) ≈ 1.0 atol=1e-4
+    @test chirality_energy(coords, [(1, 2, 3, 4)]) ≈ 0.0 atol=1e-4  # comfortably clears margin=0.3
+    @test chirality_count(coords, [(1, 2, 3, 4)]) == 0
+
+    # Scaled up (still right-handed): raw chiral_volume grows as the cube of
+    # the scale factor, but normalized_chiral_volume/chirality_energy are
+    # scale-invariant -- exactly the property that keeps sampling-time
+    # guidance numerically stable regardless of the sampler's current
+    # coordinate scale (see normalized_chiral_volume's docstring).
+    coords_scaled = 2.0 .* coords
+    @test chiral_volume(coords_scaled, 1, 2, 3, 4) ≈ 8.0
+    @test normalized_chiral_volume(coords_scaled, 1, 2, 3, 4) ≈ 1.0 atol=1e-4
+    @test chirality_energy(coords_scaled, [(1, 2, 3, 4)]) ≈ 0.0 atol=1e-4
+    @test chirality_count(coords_scaled, [(1, 2, 3, 4)]) == 0
+
+    # Mirrored (C and CB swapped) -> wrong-handed, negative volume.
+    coords_mirrored = Float64[0.0 1.0 0.0 0.0; 0.0 0.0 0.0 1.0; 0.0 0.0 1.0 0.0]
+    @test chiral_volume(coords_mirrored, 1, 2, 3, 4) ≈ -1.0
+    @test normalized_chiral_volume(coords_mirrored, 1, 2, 3, 4) ≈ -1.0 atol=1e-4
+    # margin=0.3 default -> violation = 0.3 - (-1.0) = 1.3 -> energy = 1.3^2 = 1.69
+    @test chirality_energy(coords_mirrored, [(1, 2, 3, 4)]) ≈ 1.69 atol=1e-3
+    @test chirality_count(coords_mirrored, [(1, 2, 3, 4)]) == 1
+
+    # Multiple centers: energies sum.
+    @test chirality_energy(coords_mirrored, [(1, 2, 3, 4), (1, 2, 3, 4)]) ≈ 3.38 atol=1e-3
+end
+
+@testset "Geometry.chirality_energy is differentiable and gradient points the right way" begin
+    coords_mirrored = Float64[0.0 1.0 0.0 0.0; 0.0 0.0 0.0 1.0; 0.0 0.0 1.0 0.0]
+    centers = [(1, 2, 3, 4)]
+    grad = only(Zygote.gradient(c -> chirality_energy(c, centers), coords_mirrored))
+    @test all(isfinite, grad)
+
+    e_before = chirality_energy(coords_mirrored, centers)
+    coords_after = coords_mirrored .- 0.1 .* grad
+    e_after = chirality_energy(coords_after, centers)
+    @test e_after < e_before
+end
+
+@testset "Geometry.validity_energy: chirality term folds in via chiral_centers/chirality_weight" begin
+    # 5th atom placed far away so it contributes no clash; same chain/adjacent
+    # residues as atoms 1-4 so none of those pairs clash either.
+    coords_mirrored = Float64[0.0 1.0 0.0 0.0 100.0; 0.0 0.0 0.0 1.0 0.0; 0.0 0.0 1.0 0.0 0.0]
+    elements = [:C, :C, :C, :C, :C]
+    chain_idx = [1, 1, 1, 1, 2]
+    res_index = [1, 1, 1, 1, 1]
+    bonds = Tuple{Int,Int,Float64}[]
+    centers = [(1, 2, 3, 4)]
+
+    @test validity_energy(coords_mirrored, elements, chain_idx, res_index, bonds, centers) ≈ 1.69 atol=1e-3
+    @test validity_energy(coords_mirrored, elements, chain_idx, res_index, bonds, centers; chirality_weight=0.0) ≈ 0.0
+    # Backward compatibility: omitting chiral_centers gives no chirality contribution.
+    @test validity_energy(coords_mirrored, elements, chain_idx, res_index, bonds) ≈ 0.0
+end
+
 @testset "Geometry.validity_energy is differentiable and gradient points the right way" begin
     coords = Float64[0.0 2.0; 0.0 0.0; 0.0 0.0]
     elements = [:C, :C]

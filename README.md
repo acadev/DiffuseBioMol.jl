@@ -62,17 +62,24 @@ exact golden values for deterministic components):
   stack's first two layers. `Geometry` is pure, dependency-free, Zygote-
   differentiable coordinate math — clash energy (VDW-radius-based repulsion,
   excluding covalently-local atom pairs), bond-length energy (harmonic
-  restraint against `backbone_bonds`' derived ideal-length pairs), and
-  per-atom lDDT (the real AlphaFold-style local distance difference test,
-  used as a self-supervised confidence label). `validity_guidance_step`
-  turns `Geometry.validity_energy`'s negative gradient into a sampling-time
-  correction, pluggable directly into `sample_flow`'s `post_step` hook — no
-  changes to `Sampling.FlowMatching`'s API were needed. `Verifier` is a
-  small, self-contained network (deliberately not sharing code with
-  `Model.Network`, mirroring how `Sampling` stays decoupled from `Model`)
-  predicting per-atom confidence + clash likelihood, trained against
-  `Geometry`-derived labels without needing external tools. Layer 3
-  (MolProbity/OpenMM relaxation/self-consistency refold) is still
+  restraint against `backbone_bonds`' derived ideal-length pairs), chirality
+  energy (a normalized, scale-invariant CA-stereocenter handedness term —
+  `chiral_centers` derives `(CA, N, C, CB)` quadruples per residue, the
+  correct-handedness sign/range was confirmed empirically against 164 real
+  CA centers from 1CRN/1UBQ/5PTI rather than assumed from memory, and the
+  term is normalized by substituent-vector length specifically so its
+  gradient stays bounded and doesn't blow up sampling trajectories that
+  start far from realistic molecular scale), and per-atom lDDT (the real
+  AlphaFold-style local distance difference test, used as a self-supervised
+  confidence label). `validity_guidance_step` turns `Geometry.validity_energy`'s
+  negative gradient (clash + bond + chirality, jointly weighted) into a
+  sampling-time correction, pluggable directly into `sample_flow`'s
+  `post_step` hook — no changes to `Sampling.FlowMatching`'s API were
+  needed. `Verifier` is a small, self-contained network (deliberately not
+  sharing code with `Model.Network`, mirroring how `Sampling` stays
+  decoupled from `Model`) predicting per-atom confidence + clash likelihood,
+  trained against `Geometry`-derived labels without needing external tools.
+  Layer 3 (MolProbity/OpenMM relaxation/self-consistency refold) is still
   unimplemented — it's the one layer that will need a Python interop story.
 
 v1 simplifications worth knowing about (documented in the relevant module
@@ -84,11 +91,12 @@ interpolation, not yet NeuralPLexer3's optimal-transport permutation +
 timestep shifting; symmetry conditioning (RFD3's pre-symmetrized noise for
 Cn-symmetric design) and a richer motif vocabulary (unindexed motifs, H-bond
 donor/acceptor typing) are not yet implemented; `backbone_bonds`/bond-length
-guidance only covers protein backbone geometry (RNA/DNA backbone bonds are
-future work); chirality/stereochemistry guidance isn't implemented yet —
-only clash and bond-length terms are; and `Verification.Verifier` (the
-learned verifier head) is not yet batched (only the main flow-matching model
-is, see below) since it wasn't in this round's scope.
+and chirality guidance only cover protein backbone geometry (RNA/DNA are
+future work); and `Verification.Verifier` (the learned verifier head) is not
+yet batched (only the main flow-matching model is, see below) since it
+wasn't in this round's scope, and doesn't yet predict a chirality/clash
+signal specifically informed by the new `Geometry.chirality_energy` term
+(still only confidence + clash logits).
 
 Everything else (`AgenticLoop`, `Distributed`, Layer 3 external verification)
 is a documented stub module — see each module's docstring for what it's
@@ -200,22 +208,26 @@ training exists. Instead it checks the thing `docs/PLAN.md` originally
 specified as the Phase 1 gate — does the model produce physically sane
 geometry on held-out real structures, and is it better than no learning at
 all — using only this codebase's own `Geometry` machinery (`clash_count`,
-`bond_length_rmsd`). Three conditions per held-out structure (`1L2Y`/`1VII`/
-`2GB1`, disjoint from the training set `1CRN`/`1UBQ`/`5PTI`): a raw prior
-sample (zero learning, the floor), an untrained model's `sample_flow` output
-(isolates architecture/guidance effects from learning), and a briefly-trained
-model. This is the number to track as training scales up — not a finished
-evaluation. Once there's a real trained model at meaningful scale, the next
-benchmarking rungs are: self-consistency/designability checks (RFD3-style,
-need an external refold tool), then CASP15 RNA / DockQ protein-complex
-accuracy against literature numbers.
+`bond_length_rmsd`, `chirality_count`). Four conditions per held-out
+structure (`1L2Y`/`1VII`/`2GB1`, disjoint from the training set
+`1CRN`/`1UBQ`/`5PTI`): a raw prior sample (zero learning, the floor), an
+untrained model's `sample_flow` output (isolates architecture/guidance
+effects from learning), a briefly-trained model, and that same trained
+model with `validity_guidance_step` (clash + bond + chirality) applied —
+this last comparison is the Phase 3 guidance gate: on the same model/seed,
+guided should match or beat unguided on all three metrics, since guidance is
+added at sampling time only. This is the number to track as training scales
+up — not a finished evaluation. Once there's a real trained model at
+meaningful scale, the next benchmarking rungs are: self-consistency/
+designability checks (RFD3-style, need an external refold tool), then
+CASP15 RNA / DockQ protein-complex accuracy against literature numbers.
 
 ## Roadmap
 
 0. ✅ Core data & unified any-modality tokenization (+ AtomWorks-shaped data adapter)
 1. ✅ Pairformer-lite + DiT backbone, SE(3) flow matching with a physics-informed prior (hardened: multi-head attention, real-PDB training)
 2. ✅ Generalized constraint-token conditioning system (hotspot/motif/RASA/CoM; symmetry deferred)
-3. ✅ Differentiable physical-validity guidance (clash + bond-length) + learned verifier head (confidence + clash); chirality guidance and Layer 3 external verification still open
+3. ✅ Differentiable physical-validity guidance (clash + bond-length + chirality) + learned verifier head (confidence + clash); Layer 3 external verification still open
 4. Consistency-distilled fast sampler
 5. Agentic generate→verify→curate→retrain loop
 6. Multi-node distributed training (MPI.jl)

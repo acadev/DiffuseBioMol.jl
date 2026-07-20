@@ -4,12 +4,17 @@ Stage A validity benchmark — the Phase 1 verification gate from
 model produce physically sane geometry on held-out real structures, and is
 it actually better than doing no learning at all?
 
+Also doubles as the Phase 3 guidance gate: `sample_flow` is run both with and
+without `validity_guidance_step` (clash + bond + chirality) so the guided
+column can be compared directly against the unguided one, on top of the
+existing prior/untrained/trained comparison.
+
 This deliberately does *not* reach for literature-standard benchmarks
 (PoseBusters, CASP15, DockQ) — those need either a meaningfully-trained model
 or external tool bridging, both premature right now. This harness uses only
-this codebase's own `Geometry` machinery (clash count, bond-length RMSD), so
-it's runnable today with zero new dependencies and zero GPU, and gives a
-number to track as training scales up.
+this codebase's own `Geometry` machinery (clash count, bond-length RMSD,
+chirality count), so it's runnable today with zero new dependencies and zero
+GPU, and gives a number to track as training scales up.
 
 Three conditions, per held-out structure:
 - `prior`: a raw physics-informed prior sample (`Sampling.Prior`), zero
@@ -38,24 +43,28 @@ function load_example(pdb_id, chain_id)
     x1 = target_coordinates(tokens)
     cond_features = constraint_features(no_constraints(length(tokens)))
     bonds = backbone_bonds(tokens)
+    centers = chiral_centers(tokens)
     elements = [t.element for t in tokens]
     (pdb_id=pdb_id, feat=feat, relpos=relpos, x1=x1, cond_features=cond_features,
-        bonds=bonds, elements=elements, n_atoms=length(tokens))
+        bonds=bonds, centers=centers, elements=elements, n_atoms=length(tokens))
 end
 
 """
     validity_report(label, coords, ex) -> NamedTuple
 
 Reports clash count (raw and normalized per 100 atoms, so structures of
-different sizes are comparable) and bond-length RMSD (Å) for one sampled
-structure against one loaded example's bonded-pair/element/chain metadata.
+different sizes are comparable), bond-length RMSD (Å), and chirality
+violation count for one sampled structure against one loaded example's
+bonded-pair/chiral-center/element/chain metadata.
 """
 function validity_report(label, coords, ex)
     nclash = clash_count(Float32.(coords), ex.elements, ex.feat.chain_idx, ex.feat.res_index)
     brmsd = bond_length_rmsd(Float32.(coords), ex.bonds)
+    nchiral = chirality_count(Float32.(coords), ex.centers)
     (label=label, pdb_id=ex.pdb_id, n_atoms=ex.n_atoms,
         clashes=nclash, clashes_per_100_atoms=round(100 * nclash / ex.n_atoms; digits=2),
-        bond_rmsd_angstrom=round(brmsd; digits=3))
+        bond_rmsd_angstrom=round(brmsd; digits=3),
+        chirality_violations=nchiral, n_chiral_centers=length(ex.centers))
 end
 
 function train!(model, ps, st, examples, rng; n_epochs=5, lr=1.0f-3)
@@ -96,24 +105,33 @@ function main(; n_epochs=5, n_steps=20, seed=0)
 
         x_trained, _ = sample_flow(model, ps_trained, st, ex.feat, ex.relpos, ex.cond_features, rng; n_steps=n_steps)
         push!(reports, validity_report("trained", x_trained, ex))
+
+        # Phase 3 gate: same trained model/seed, with vs. without in-loop
+        # clash+bond+chirality guidance (Sampling.FlowMatching's post_step hook).
+        post = validity_guidance_step(ex.elements, ex.feat.chain_idx, ex.feat.res_index, ex.bonds, ex.centers)
+        x_guided, _ = sample_flow(model, ps_trained, st, ex.feat, ex.relpos, ex.cond_features, rng; n_steps=n_steps, post_step=post)
+        push!(reports, validity_report("trained+guided", x_guided, ex))
     end
 
-    println("\n", "="^88)
-    println(rpad("label", 12), rpad("pdb_id", 10), rpad("n_atoms", 10), rpad("clashes", 10),
-        rpad("clashes/100atoms", 18), "bond_rmsd (A)")
-    println("-"^88)
+    println("\n", "="^108)
+    println(rpad("label", 16), rpad("pdb_id", 10), rpad("n_atoms", 10), rpad("clashes", 10),
+        rpad("clashes/100atoms", 18), rpad("bond_rmsd (A)", 15), rpad("chirality_bad", 15), "n_chiral_centers")
+    println("-"^108)
     for r in reports
         println(
-            rpad(r.label, 12), rpad(r.pdb_id, 10), rpad(string(r.n_atoms), 10),
+            rpad(r.label, 16), rpad(r.pdb_id, 10), rpad(string(r.n_atoms), 10),
             rpad(string(r.clashes), 10), rpad(string(r.clashes_per_100_atoms), 18),
-            string(r.bond_rmsd_angstrom),
+            rpad(string(r.bond_rmsd_angstrom), 15), rpad(string(r.chirality_violations), 15),
+            string(r.n_chiral_centers),
         )
     end
-    println("="^88)
-    println("\nExpected pattern as training scales up: trained < untrained < prior")
-    println("on both metrics, for each held-out structure. At this toy scale/training")
-    println("budget, don't expect strong separation yet -- this harness is the gate to")
-    println("track as Phase 1/3 training is scaled up, not a finished evaluation.")
+    println("="^108)
+    println("\nExpected pattern as training scales up: trained < untrained < prior on")
+    println("clashes/bond_rmsd, for each held-out structure. trained+guided is the Phase 3")
+    println("gate: it should match or beat trained on all three metrics (same model/seed,")
+    println("guidance added at sampling time only). At this toy scale/training budget,")
+    println("don't expect strong separation yet -- this harness is the gate to track as")
+    println("Phase 1/3 training is scaled up, not a finished evaluation.")
 end
 
 if abspath(PROGRAM_FILE) == (@__FILE__)

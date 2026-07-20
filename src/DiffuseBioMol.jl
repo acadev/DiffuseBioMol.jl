@@ -41,8 +41,9 @@ export PriorConfig, sample_prior
 export TrainingExample, prepare_training_example, cfm_loss, sample_flow
 export BatchedTrainingExample
 export VDW_RADII, BACKBONE_BOND_LENGTHS, clash_energy, bond_energy, validity_energy, lddt, clash_count, bond_length_rmsd
+export chiral_volume, normalized_chiral_volume, chirality_energy, chirality_count
 export kabsch_align, aligned_rmsd
 export VerifierConfig, build_verifier
-export backbone_bonds, validity_guidance_step, verifier_loss
+export backbone_bonds, chiral_centers, validity_guidance_step, verifier_loss
 
 end # module DiffuseBioMol
