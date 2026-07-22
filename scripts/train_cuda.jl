@@ -29,6 +29,19 @@ Usage:
         --resume ./ckpts/checkpoint_0050.jls \\
         --wandb-project diffusebio --wandb-resume-id <run-id>
 
+    # Cache preprocessed (parsed+tokenized+featurized) structures on first run,
+    # skip re-preprocessing entirely on every subsequent launch against the
+    # same data_dir/n-targets/max-atoms/recursive combination
+    julia --project=. scripts/train_cuda.jl /path/to/pdbs --cache-file ./cache/examples.jls
+
+    # Build a reusable library once (see preprocess_dataset.jl), then train
+    # against whatever subset of it a given run wants — no re-parsing ever,
+    # and --n-targets/--max-atoms can differ freely between runs since the
+    # library isn't tied to either
+    julia --project=. scripts/preprocess_dataset.jl /path/to/pdbs \\
+        --library-dir ./library --limit 1000
+    julia --project=. scripts/train_cuda.jl --library-dir ./library --n-targets 200
+
     # CPU smoke-test, no WandB
     julia --project=. scripts/train_cuda.jl \\
         --epochs 5 --d-single 32 --d-pair 16 --n-heads 4 \\
@@ -36,6 +49,28 @@ Usage:
 
 Checkpoints are Serialization.serialize'd NamedTuples (epoch, ps, st) written
 to --checkpoint-dir and loadable again with --resume.
+
+--cache-file similarly serializes the preprocessed examples (post parse/
+tokenize/featurize, pre-batching) after the first run, keyed against
+data_dir/n_targets/max_atoms/recursive — a mismatch on any of those triggers
+a warning and a full re-preprocess rather than silently reusing stale data.
+Preprocessing is CPU-bound and cheap per structure (parsing + tokenizing),
+but at real-dataset scale (hundreds of thousands of structures) redoing it on
+every launch adds up; this trades that recurring cost for a one-time cost.
+Note --seed is deliberately *not* part of the cache key: it only affects
+which subset of files get selected when candidates outnumber --n-targets,
+and re-randomizing that on every launch would defeat the point of caching.
+
+--library-dir is the other, more flexible way to skip re-preprocessing: point
+it at a directory built by `preprocess_dataset.jl` (one small serialized file
+per structure, independent of any single run's --n-targets/--max-atoms/
+--recursive) and every run just reads whatever subset it wants straight off
+disk. Prefer --cache-file for a single training configuration you'll rerun
+as-is (simplest — one flag, no separate preprocessing step); prefer
+--library-dir once you're exploring multiple --n-targets/--max-atoms
+combinations against the same larger pool of structures, since --cache-file
+would force a full re-preprocess on every combination change. When both a
+source directory and --library-dir are given, --library-dir wins.
 """
 
 using Printf
@@ -78,6 +113,8 @@ function parse_args(args)
         :checkpoint_every      => 10,
         :resume                => nothing,
         :recursive             => false,    # --recursive: walk subdirs for PDB mirrors
+        :cache_file            => nothing,  # --cache-file: cache preprocessed examples across runs
+        :library_dir           => nothing,  # --library-dir: read from a preprocess_dataset.jl library instead
         # Model config — H100-scale defaults
         :d_single              => 128,
         :d_pair                => 64,
@@ -105,6 +142,8 @@ function parse_args(args)
         elseif a == "--checkpoint-every"     ; kw[:checkpoint_every]    = parse(Int,     nxt); i += 2
         elseif a == "--resume"               ; kw[:resume]              = nxt;                 i += 2
         elseif a == "--recursive"            ; kw[:recursive]           = true;                i += 1
+        elseif a == "--cache-file"           ; kw[:cache_file]          = nxt;                 i += 2
+        elseif a == "--library-dir"          ; kw[:library_dir]         = nxt;                 i += 2
         elseif a == "--d-single"             ; kw[:d_single]            = parse(Int,     nxt); i += 2
         elseif a == "--d-pair"               ; kw[:d_pair]              = parse(Int,     nxt); i += 2
         elseif a == "--n-heads"              ; kw[:n_heads]             = parse(Int,     nxt); i += 2
@@ -126,39 +165,53 @@ end
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-const CANDIDATE_TARGETS = [
-    ("1CRN","A"),("1UBQ","A"),("5PTI","A"),("1L2Y","A"),("1VII","A"),("2GB1","A"),
-    ("1ENH","A"),("1PGB","A"),("1SHG","A"),("2CI2","A"),("1IGD","A"),("1TEN","A"),
-    ("2TRX","A"),("1AHO","A"),("1BTA","A"),("1CSP","A"),("1FNA","A"),("1MJC","A"),
-    ("1PIN","A"),("1HHP","A"),("2PTL","A"),("1UBI","A"),("1COA","A"),("1FXD","A"),
-]
+include(joinpath(@__DIR__, "dataset_utils.jl"))
 
-function tokenize_example(label, residues)
-    tokens = tokenize_structure(residues)
-    isempty(tokens) && error("no tokens after parsing/filtering")
-    feat = featurize(tokens)
-    (pdb_id        = label,
-     tokens        = tokens,
-     feat          = feat,
-     relpos        = relpos_buckets(feat),
-     x1            = target_coordinates(tokens),
-     cond_features = constraint_features(no_constraints(length(tokens))),
-     n_atoms       = length(tokens))
-end
+"""
+    load_library_example(path) -> NamedTuple
 
-function load_rcsb_example((pdb_id, chain_id))
-    tokenize_example(pdb_id, restrict_to_chain(fetch_pdb(pdb_id), chain_id))
-end
+Deserializes one already-preprocessed structure written by
+`preprocess_dataset.jl` (same shape as `tokenize_example`'s return value) —
+the whole point of `--library-dir` is that this is just a disk read, no
+parsing/tokenizing/featurizing.
+"""
+load_library_example(path) = Serialization.deserialize(path)
 
-function load_local_example(path)
-    res = parse_structure(path)
-    isempty(res) && error("no residues parsed")
-    ch = largest_chain(res)
-    tokenize_example(splitext(basename(path))[1], restrict_to_chain(res, ch))
-end
+"""
+    cache_key(; data_dir, library_dir, n_targets, max_atoms, recursive) -> NamedTuple
 
-function load_targets(; data_dir, n_targets, max_atoms, recursive, rng)
-    if data_dir === nothing
+The subset of `load_targets`' arguments that determine *which structures* end
+up in `examples` (deliberately excludes `rng`/`--seed` — see this file's
+module docstring for why). Stored alongside the cached examples so a stale
+cache built with different arguments is detected and rejected rather than
+silently reused.
+"""
+cache_key(; data_dir, library_dir, n_targets, max_atoms, recursive) =
+    (data_dir=data_dir, library_dir=library_dir, n_targets=n_targets, max_atoms=max_atoms, recursive=recursive)
+
+function load_targets(; data_dir, library_dir=nothing, n_targets, max_atoms, recursive, rng, cache_file=nothing)
+    key = cache_key(; data_dir, library_dir, n_targets, max_atoms, recursive)
+
+    if cache_file !== nothing && isfile(cache_file)
+        cached = Serialization.deserialize(cache_file)
+        if cached.key == key
+            println("Cache   : loaded $(length(cached.examples)) preprocessed structures from $cache_file (skipped re-parsing)")
+            return cached.examples
+        end
+        @warn "Cache at $cache_file was built with different arguments than this run; re-preprocessing and overwriting it.\n" *
+              "  cached : $(cached.key)\n  current: $key"
+    end
+
+    if library_dir !== nothing
+        # Already preprocessed by preprocess_dataset.jl — one small file per
+        # structure, decoupled from any run's n_targets/max_atoms, so this is
+        # a plain disk read (deserialize), not a re-parse.
+        candidates = shuffle(rng, filter(f -> endswith(f, ".jls"), readdir(library_dir; join=true)))
+        isempty(candidates) && throw(ArgumentError(
+            "no preprocessed structures (*.jls) found in $library_dir — " *
+            "run scripts/preprocess_dataset.jl against a source directory first"))
+        loader = load_library_example
+    elseif data_dir === nothing
         candidates = CANDIDATE_TARGETS
         loader = load_rcsb_example
     else
@@ -176,10 +229,18 @@ function load_targets(; data_dir, n_targets, max_atoms, recursive, rng)
             max_atoms !== nothing && ex.n_atoms > max_atoms && continue
             push!(examples, ex)
         catch e
-            label = data_dir === nothing ? c[1] : basename(string(c))
+            label = c isa Tuple ? c[1] : basename(string(c))
             println("  skip $label: $(sprint(showerror, e))")
         end
     end
+
+    if cache_file !== nothing
+        cache_dir = dirname(cache_file)
+        isempty(cache_dir) || mkpath(cache_dir)
+        Serialization.serialize(cache_file, (key=key, examples=examples))
+        println("Cache   : wrote $(length(examples)) preprocessed structures to $cache_file")
+    end
+
     examples
 end
 
@@ -305,14 +366,21 @@ function main(args=ARGS)
 
     # ── data
     rng = Random.Xoshiro(kw[:seed])
-    src = kw[:data_dir] === nothing ? "RCSB (live fetch)" : kw[:data_dir]
+    if kw[:library_dir] !== nothing
+        kw[:data_dir] !== nothing && println("Note    : both a source dir and --library-dir were given; --library-dir takes precedence.")
+        src = "library: $(kw[:library_dir])"
+    else
+        src = kw[:data_dir] === nothing ? "RCSB (live fetch)" : kw[:data_dir]
+    end
     @printf("Data    : %s  (target=%d, max_atoms=%s)\n",
         src, kw[:n_targets], kw[:max_atoms] === nothing ? "none" : string(kw[:max_atoms]))
     t_load = @elapsed examples = load_targets(;
-        data_dir  = kw[:data_dir],
-        n_targets = kw[:n_targets],
-        max_atoms = kw[:max_atoms],
-        recursive = kw[:recursive],
+        data_dir    = kw[:data_dir],
+        library_dir = kw[:library_dir],
+        n_targets   = kw[:n_targets],
+        max_atoms   = kw[:max_atoms],
+        recursive   = kw[:recursive],
+        cache_file  = kw[:cache_file],
         rng)
     isempty(examples) && error("no structures loaded — check data_dir or network")
     natoms = [ex.n_atoms for ex in examples]
