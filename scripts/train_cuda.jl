@@ -47,6 +47,12 @@ Usage:
         --epochs 5 --d-single 32 --d-pair 16 --n-heads 4 \\
         --n-pairformer-layers 2 --n-dit-layers 2
 
+    # Community-standard train/val/test split (defaults: 10% val, 10% test,
+    # 80% train). Val loss is tracked every epoch alongside train loss; test
+    # loss is computed once, after all training is done.
+    julia --project=. scripts/train_cuda.jl /path/to/pdbs \\
+        --val-fraction 0.1 --test-fraction 0.1
+
 Checkpoints are Serialization.serialize'd NamedTuples (epoch, ps, st) written
 to --checkpoint-dir and loadable again with --resume.
 
@@ -71,6 +77,29 @@ as-is (simplest — one flag, no separate preprocessing step); prefer
 combinations against the same larger pool of structures, since --cache-file
 would force a full re-preprocess on every combination change. When both a
 source directory and --library-dir are given, --library-dir wins.
+
+--val-fraction/--test-fraction carve the *loaded* pool (i.e. out of
+--n-targets, before any split — a run with --n-targets 1000 --val-fraction
+0.1 --test-fraction 0.1 trains on 800, not 1000) into the standard
+three-way split:
+  - train (the rest, after val/test are carved off): the only set that ever
+    produces a gradient / touches `ps`.
+  - val (--val-fraction, default 0.1): evaluated every epoch with a
+    forward-only pass (`eval_on_batch` — no gradient, never influences
+    training) and logged as `val/loss` alongside `train/loss`. This is what
+    tells you the model is generalizing rather than memorizing — train loss
+    falling while val loss stalls or rises is the classic overfitting
+    signature. Since it's checked every epoch, it's implicitly used to
+    *watch* training even though nothing here currently acts on it
+    automatically (e.g. no early stopping / best-checkpoint selection yet).
+  - test (--test-fraction, default 0.1): held out completely and evaluated
+    exactly once, after all training/checkpointing is finished, logged as a
+    single `test/loss` value. Never seen — not even for monitoring — until
+    that final check, which is what makes it a trustworthy final number
+    rather than something that was implicitly tuned against.
+Either fraction can be set to 0 to disable that split (falls back to the
+next-most-held-out set for the end-of-run structural validity check: test,
+then val, then train).
 """
 
 using Printf
@@ -105,6 +134,8 @@ function parse_args(args)
         :data_dir              => nothing,
         :n_targets             => 500,
         :max_atoms             => 2000,
+        :val_fraction          => 0.1,      # --val-fraction: held out for per-epoch val/loss (0 disables)
+        :test_fraction         => 0.1,      # --test-fraction: held out for a one-time final test/loss (0 disables)
         :n_epochs              => 100,
         :batch_size            => 16,
         :lr                    => 1.0f-4,
@@ -137,6 +168,8 @@ function parse_args(args)
         elseif a == "--lr"                   ; kw[:lr]                  = parse(Float32, nxt); i += 2
         elseif a == "--n-targets"            ; kw[:n_targets]           = parse(Int,     nxt); i += 2
         elseif a == "--max-atoms"            ; kw[:max_atoms]           = parse(Int,     nxt); i += 2
+        elseif a == "--val-fraction"         ; kw[:val_fraction]        = parse(Float64, nxt); i += 2
+        elseif a == "--test-fraction"        ; kw[:test_fraction]       = parse(Float64, nxt); i += 2
         elseif a == "--seed"                 ; kw[:seed]                = parse(Int,     nxt); i += 2
         elseif a == "--checkpoint-dir"       ; kw[:checkpoint_dir]      = nxt;                 i += 2
         elseif a == "--checkpoint-every"     ; kw[:checkpoint_every]    = parse(Int,     nxt); i += 2
@@ -272,6 +305,31 @@ function train_on_batch(model, ps, st, opt_state, batch, rng, dev)
     (ps, opt_state, Float32(loss))
 end
 
+"""
+    eval_on_batch(model, ps, st, batch, rng, dev) -> Float32
+
+Same forward pass as `train_on_batch`, minus the `Zygote.pullback`/gradient/
+optimizer-update — a read-only loss estimate that never touches `ps`. Used
+for both the per-epoch val loss and the one-time final test loss, so
+evaluating either can never leak into the trained weights.
+"""
+function eval_on_batch(model, ps, st, batch, rng, dev)
+    bf     = batch_features([ex.feat for ex in batch])
+    rp     = batch_relpos([ex.relpos for ex in batch])
+    cf     = batch_cond_features([ex.cond_features for ex in batch])
+    pb     = attention_pad_bias(bf.pad_mask)
+    x1     = batch_coords([Float32.(ex.x1) for ex in batch])
+    ex_cpu = prepare_training_example(bf, x1, cf, rng)
+
+    bf_d = to_device(bf, dev)
+    rp_d = dev(rp)
+    pb_d = dev(pb)
+    ex_d = to_device(ex_cpu, dev)
+
+    loss, _ = cfm_loss(model, ps, st, bf_d, rp_d, pb_d, ex_d)
+    Float32(loss)
+end
+
 # ── Checkpointing ─────────────────────────────────────────────────────────────
 
 function save_checkpoint(dir, epoch, ps, st, cpu_dev)
@@ -291,12 +349,12 @@ end
 # ── WandB helpers ─────────────────────────────────────────────────────────────
 
 """
-    init_wandb(kw, cfg, n_params, n_examples, device_str) -> WandbLogger or nothing
+    init_wandb(kw, cfg, n_params, n_train, n_val, n_test, device_str) -> WandbLogger or nothing
 
 Initialises a WandB run if --wandb-project was given and Wandb.jl is installed;
 returns nothing otherwise so all call sites can use `isnothing(lg)` to skip.
 """
-function init_wandb(kw, cfg, n_params, n_examples, device_str)
+function init_wandb(kw, cfg, n_params, n_train, n_val, n_test, device_str)
     kw[:wandb_project] === nothing && return nothing
     if !HAS_WANDB
         @warn "--wandb-project given but Wandb.jl is not installed; tracking disabled.\n" *
@@ -305,7 +363,12 @@ function init_wandb(kw, cfg, n_params, n_examples, device_str)
     end
     config = Dict(
         "device"            => device_str,
-        "n_structures"      => n_examples,
+        "n_structures"      => n_train + n_val + n_test,
+        "n_train"           => n_train,
+        "n_val"             => n_val,
+        "n_test"            => n_test,
+        "val_fraction"      => kw[:val_fraction],
+        "test_fraction"     => kw[:test_fraction],
         "max_atoms"         => kw[:max_atoms],
         "batch_size"        => kw[:batch_size],
         "lr"                => kw[:lr],
@@ -326,6 +389,7 @@ function init_wandb(kw, cfg, n_params, n_examples, device_str)
     lg = WandbLogger(;
         project = kw[:wandb_project],
         name    = kw[:wandb_name],
+        entity  = kw[:wandb_entity],
         config,
         extra...,
     )
@@ -388,6 +452,23 @@ function main(args=ARGS)
         length(examples), t_load,
         minimum(natoms), sum(natoms) / length(natoms), maximum(natoms))
 
+    # ── train/val/test split — the standard three-way split (see module
+    # docstring): val is checked every epoch to watch generalization during
+    # training, test is held out completely and checked exactly once at the
+    # end. Neither ever produces a gradient (see eval_on_batch).
+    n_val  = kw[:val_fraction]  > 0 ? max(1, round(Int, kw[:val_fraction]  * length(examples))) : 0
+    n_test = kw[:test_fraction] > 0 ? max(1, round(Int, kw[:test_fraction] * length(examples))) : 0
+    n_val + n_test < length(examples) || error(
+        "--val-fraction ($(kw[:val_fraction])) + --test-fraction ($(kw[:test_fraction])) " *
+        "leaves no structures for training (n=$(length(examples)), val=$n_val, test=$n_test)")
+    split_order    = shuffle(rng, 1:length(examples))
+    val_examples   = examples[split_order[1:n_val]]
+    test_examples  = examples[split_order[n_val+1:n_val+n_test]]
+    train_examples = examples[split_order[n_val+n_test+1:end]]
+    @printf("Split   : %d train / %d val / %d test  (val_fraction=%g, test_fraction=%g)\n",
+        length(train_examples), length(val_examples), length(test_examples),
+        kw[:val_fraction], kw[:test_fraction])
+
     # ── model
     cfg   = ModelConfig(
         d_single           = kw[:d_single],
@@ -419,19 +500,24 @@ function main(args=ARGS)
     opt_state = Optimisers.setup(Optimisers.Adam(kw[:lr]), ps)
 
     # ── WandB init (after model is built so we can log n_params in config)
-    wandb_lg = init_wandb(kw, cfg, n_params, length(examples), device_str)
+    wandb_lg = init_wandb(kw, cfg, n_params, length(train_examples), length(val_examples), length(test_examples), device_str)
 
     # ── training loop
     n_epochs   = kw[:n_epochs]
     batch_size = kw[:batch_size]
-    n_batches  = cld(length(examples), batch_size)
-    @printf("\nTraining: epochs %d–%d  batch_size=%d  (~%d batches/epoch)  lr=%g\n\n",
-        start_epoch, n_epochs, batch_size, n_batches, kw[:lr])
+    n_batches  = cld(length(train_examples), batch_size)
+    @printf("\nTraining: epochs %d–%d  batch_size=%d  (~%d train batches/epoch, %d val batches/epoch)  lr=%g\n\n",
+        start_epoch, n_epochs, batch_size, n_batches, cld(length(val_examples), batch_size), kw[:lr])
+
+    # Val batches are fixed once — no reshuffling needed, since eval_on_batch
+    # never updates ps and batch composition doesn't affect a forward-only pass.
+    val_batches = [val_examples[i:min(i + batch_size - 1, end)]
+                    for i in 1:batch_size:length(val_examples)]
 
     ep_pad = ndigits(n_epochs)
     for epoch in start_epoch:n_epochs
-        order   = shuffle(rng, 1:length(examples))
-        batches = [examples[order[i:min(i + batch_size - 1, end)]]
+        order   = shuffle(rng, 1:length(train_examples))
+        batches = [train_examples[order[i:min(i + batch_size - 1, end)]]
                    for i in 1:batch_size:length(order)]
 
         epoch_losses = Float32[]
@@ -439,20 +525,32 @@ function main(args=ARGS)
             ps, opt_state, loss = train_on_batch(model, ps, st, opt_state, batch, rng, dev)
             push!(epoch_losses, loss)
         end
-
         mean_loss = sum(epoch_losses) / length(epoch_losses)
-        @printf("epoch %*d/%d  %5.1fs  mean_loss=%.4f  per-batch=%s\n",
+
+        # Val loss: forward-only, no gradient update — checked every epoch to
+        # watch generalization during training (see module docstring).
+        val_loss = if isempty(val_batches)
+            nothing
+        else
+            val_losses = [eval_on_batch(model, ps, st, vb, rng, dev) for vb in val_batches]
+            sum(val_losses) / length(val_losses)
+        end
+
+        @printf("epoch %*d/%d  %5.1fs  train_loss=%.4f%s  per-batch=%s\n",
             ep_pad, epoch, n_epochs, t_epoch, mean_loss,
+            val_loss === nothing ? "" : @sprintf("  val_loss=%.4f", val_loss),
             string(round.(epoch_losses; digits=3)))
 
         # Log epoch metrics to WandB
-        wlog(wandb_lg, Dict(
+        epoch_log = Dict(
             "train/loss"         => mean_loss,
             "train/loss_min"     => minimum(epoch_losses),
             "train/loss_max"     => maximum(epoch_losses),
             "train/epoch_time_s" => t_epoch,
             "train/lr"          => kw[:lr],
-        ); step=epoch)
+        )
+        val_loss !== nothing && (epoch_log["val/loss"] = val_loss)
+        wlog(wandb_lg, epoch_log; step=epoch)
 
         if kw[:checkpoint_dir] !== nothing && epoch % kw[:checkpoint_every] == 0
             save_checkpoint(kw[:checkpoint_dir], epoch, ps, st, cpu_dev)
@@ -464,12 +562,34 @@ function main(args=ARGS)
         save_checkpoint(kw[:checkpoint_dir], n_epochs, ps, st, cpu_dev)
     end
 
+    # ── final test loss — computed exactly once, after all training and
+    # checkpointing decisions are already made, so it's never implicitly
+    # tuned against (unlike val, which was watched every epoch above).
+    if !isempty(test_examples)
+        test_batches = [test_examples[i:min(i + batch_size - 1, end)]
+                         for i in 1:batch_size:length(test_examples)]
+        test_losses  = [eval_on_batch(model, ps, st, tb, rng, dev) for tb in test_batches]
+        final_test_loss = sum(test_losses) / length(test_losses)
+        @printf("\nFinal test loss (%d held-out structures, never seen during training): %.4f\n",
+            length(test_examples), final_test_loss)
+        wlog(wandb_lg, Dict("test/loss" => final_test_loss))
+    end
+
     # ── validity check (single-structure CPU API — keeps sample_flow unchanged)
-    n_check = min(5, length(examples))
+    # Prefer the held-out test set (same rationale as the final test loss
+    # above); fall back to val, then train_examples, if a set was disabled.
+    check_pool, check_label = if !isempty(test_examples)
+        (test_examples, "held-out test")
+    elseif !isempty(val_examples)
+        (val_examples, "held-out val")
+    else
+        (train_examples, "training")
+    end
+    n_check = min(5, length(check_pool))
     ps_cpu  = cpu_dev(ps)
     st_cpu  = cpu_dev(st)
-    println("\nValidity check on $n_check structures (single-structure, CPU):")
-    for ex in examples[1:n_check]
+    println("\nValidity check on $n_check $check_label structures (single-structure, CPU):")
+    for ex in check_pool[1:n_check]
         x_hat, _ = sample_flow(model, ps_cpu, st_cpu, ex.feat, ex.relpos,
                                 ex.cond_features, rng; n_steps=20)
         rmsd    = aligned_rmsd(x_hat, Float32.(ex.x1))
@@ -482,9 +602,9 @@ function main(args=ARGS)
 
         # Log per-structure validity metrics to WandB
         wlog(wandb_lg, Dict(
-            "val/rmsd_$(ex.pdb_id)"      => rmsd,
-            "val/clashes_$(ex.pdb_id)"   => clashes,
-            "val/bond_rmsd_$(ex.pdb_id)" => brmsd,
+            "test/rmsd_$(ex.pdb_id)"      => rmsd,
+            "test/clashes_$(ex.pdb_id)"   => clashes,
+            "test/bond_rmsd_$(ex.pdb_id)" => brmsd,
         ))
     end
 
@@ -493,7 +613,7 @@ function main(args=ARGS)
         all_rmsds = Float64[]
         all_clashes = Int[]
         all_brmsds = Float64[]
-        for ex in examples[1:n_check]
+        for ex in check_pool[1:n_check]
             x_hat, _ = sample_flow(model, ps_cpu, st_cpu, ex.feat, ex.relpos,
                                     ex.cond_features, rng; n_steps=20)
             push!(all_rmsds,   aligned_rmsd(x_hat, Float32.(ex.x1)))
@@ -502,16 +622,17 @@ function main(args=ARGS)
             push!(all_brmsds,  bond_length_rmsd(x_hat, backbone_bonds(ex.tokens)))
         end
         wlog(wandb_lg, Dict(
-            "val/mean_rmsd"      => sum(all_rmsds)   / n_check,
-            "val/mean_clashes"   => sum(all_clashes) / n_check,
-            "val/mean_bond_rmsd" => sum(all_brmsds)  / n_check,
+            "test/mean_rmsd"      => sum(all_rmsds)   / n_check,
+            "test/mean_clashes"   => sum(all_clashes) / n_check,
+            "test/mean_bond_rmsd" => sum(all_brmsds)  / n_check,
         ))
     end
 
     # Close the WandB run — uploads remaining data and marks the run finished
     wandb_lg !== nothing && close(wandb_lg)
 
-    (model=model, ps=ps_cpu, st=st_cpu, examples=examples)
+    (model=model, ps=ps_cpu, st=st_cpu, examples=examples,
+        train_examples=train_examples, val_examples=val_examples, test_examples=test_examples)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
