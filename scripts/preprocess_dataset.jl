@@ -96,6 +96,14 @@ end
 function main(args=ARGS)
     kw = parse_args(args)
     kw[:data_dir] === nothing && error("a source directory of PDB/mmCIF files is required (positional arg)")
+    isdir(kw[:data_dir]) || error(
+        "'$(kw[:data_dir])' is not a directory. If this doesn't look like the path you " *
+        "meant to pass, this is almost always a shell issue in the launch command/script, " *
+        "not a DiffuseBioMol bug — common causes: a `#` comment on a line that also has a " *
+        "trailing `\\` line-continuation (bash joins continued lines before parsing " *
+        "comments, so a comment can swallow or leak into the next line unexpectedly — put " *
+        "comments on their own line instead), or an unset/unquoted \$DATA_DIR-style " *
+        "variable substituting to something unexpected (always double-quote it: \"\$DATA_DIR\").")
     kw[:library_dir] === nothing && error("--library-dir is required")
     kw[:num_shards] >= 1 || error("--num-shards must be >= 1 (got $(kw[:num_shards]))")
     0 <= kw[:shard_id] < kw[:num_shards] || error(
