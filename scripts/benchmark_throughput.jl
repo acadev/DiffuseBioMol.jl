@@ -135,10 +135,13 @@ function benchmark_batched_step(model, ps, st, ex, batch_size::Int, rng; n_stead
     batched_feat = to_device(batched_feat_cpu, device)
     relpos_batched = device(relpos_cpu)
     pad_bias = device(attention_pad_bias(batched_feat_cpu.pad_mask))
-    example = BatchedTrainingExample(
-        device(example_cpu.x_t), example_cpu.t, device(example_cpu.target_v),
-        device(Array{Bool}(example_cpu.mask)), device(example_cpu.cond_features),
-    )
+    # Use the dedicated to_device(::BatchedTrainingExample, dev) method (see
+    # Sampling.FlowMatching) rather than reconstructing the struct by hand —
+    # a manual field-by-field version here previously left `t` un-moved,
+    # causing a device-mismatch error the first time this GPU path was
+    # actually exercised on real hardware (this script's own docstring noted
+    # it was "written but not executable/verified" without a GPU available).
+    example = to_device(example_cpu, device)
 
     # Warmup: pay this batch size's first-call compile cost once, uncounted,
     # so the steady-state numbers below are comparable across batch sizes
