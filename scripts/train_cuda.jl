@@ -578,6 +578,11 @@ function main(args=ARGS)
     # ── validity check (single-structure CPU API — keeps sample_flow unchanged)
     # Prefer the held-out test set (same rationale as the final test loss
     # above); fall back to val, then train_examples, if a set was disabled.
+    # Samples both unguided and with Verification's clash+bond+chirality
+    # guidance (validity_guidance_step, plugged into sample_flow's post_step
+    # hook — Phase 3) so a run's console/WandB output directly shows how much
+    # of any bad geometry is "sampling isn't corrected" vs. "the model hasn't
+    # learned it," without needing to retrain anything.
     check_pool, check_label = if !isempty(test_examples)
         (test_examples, "held-out test")
     elseif !isempty(val_examples)
@@ -588,43 +593,53 @@ function main(args=ARGS)
     n_check = min(5, length(check_pool))
     ps_cpu  = cpu_dev(ps)
     st_cpu  = cpu_dev(st)
-    println("\nValidity check on $n_check $check_label structures (single-structure, CPU):")
-    for ex in check_pool[1:n_check]
-        x_hat, _ = sample_flow(model, ps_cpu, st_cpu, ex.feat, ex.relpos,
-                                ex.cond_features, rng; n_steps=20)
-        rmsd    = aligned_rmsd(x_hat, Float32.(ex.x1))
-        bonds   = backbone_bonds(ex.tokens)
-        brmsd   = bond_length_rmsd(x_hat, bonds)
-        elems   = [t.element for t in ex.tokens]
-        clashes = clash_count(x_hat, elems, ex.feat.chain_idx, ex.feat.res_index)
-        @printf("  %-12s %4d atoms  RMSD=%6.2f Å  clashes=%3d  bond-RMSD=%.3f Å\n",
-            ex.pdb_id, ex.n_atoms, rmsd, clashes, brmsd)
+    println("\nValidity check on $n_check $check_label structures (single-structure, CPU; unguided vs. clash+bond+chirality-guided sampling):")
 
-        # Log per-structure validity metrics to WandB
+    unguided_rmsds, unguided_clashes, unguided_brmsds = Float64[], Int[], Float64[]
+    guided_rmsds,   guided_clashes,   guided_brmsds   = Float64[], Int[], Float64[]
+    for ex in check_pool[1:n_check]
+        elements = [t.element for t in ex.tokens]
+        bonds    = backbone_bonds(ex.tokens)
+        centers  = chiral_centers(ex.tokens)
+
+        x_unguided, _ = sample_flow(model, ps_cpu, st_cpu, ex.feat, ex.relpos,
+                                     ex.cond_features, rng; n_steps=20)
+        rmsd_u    = aligned_rmsd(x_unguided, Float32.(ex.x1))
+        brmsd_u   = bond_length_rmsd(x_unguided, bonds)
+        clashes_u = clash_count(x_unguided, elements, ex.feat.chain_idx, ex.feat.res_index)
+
+        post = validity_guidance_step(elements, ex.feat.chain_idx, ex.feat.res_index, bonds, centers)
+        x_guided, _ = sample_flow(model, ps_cpu, st_cpu, ex.feat, ex.relpos,
+                                   ex.cond_features, rng; n_steps=20, post_step=post)
+        rmsd_g    = aligned_rmsd(x_guided, Float32.(ex.x1))
+        brmsd_g   = bond_length_rmsd(x_guided, bonds)
+        clashes_g = clash_count(x_guided, elements, ex.feat.chain_idx, ex.feat.res_index)
+
+        @printf("  %-12s %4d atoms  unguided: RMSD=%6.2f Å clashes=%3d bond-RMSD=%.3f Å  |  guided: RMSD=%6.2f Å clashes=%3d bond-RMSD=%.3f Å\n",
+            ex.pdb_id, ex.n_atoms, rmsd_u, clashes_u, brmsd_u, rmsd_g, clashes_g, brmsd_g)
+
+        push!(unguided_rmsds, rmsd_u); push!(unguided_clashes, clashes_u); push!(unguided_brmsds, brmsd_u)
+        push!(guided_rmsds,   rmsd_g); push!(guided_clashes,   clashes_g); push!(guided_brmsds,   brmsd_g)
+
         wlog(wandb_lg, Dict(
-            "test/rmsd_$(ex.pdb_id)"      => rmsd,
-            "test/clashes_$(ex.pdb_id)"   => clashes,
-            "test/bond_rmsd_$(ex.pdb_id)" => brmsd,
+            "test/rmsd_$(ex.pdb_id)"      => rmsd_u,
+            "test/clashes_$(ex.pdb_id)"   => clashes_u,
+            "test/bond_rmsd_$(ex.pdb_id)" => brmsd_u,
+            "test/guided_rmsd_$(ex.pdb_id)"      => rmsd_g,
+            "test/guided_clashes_$(ex.pdb_id)"   => clashes_g,
+            "test/guided_bond_rmsd_$(ex.pdb_id)" => brmsd_g,
         ))
     end
 
     # Log summary validity stats across all checked structures
     if n_check > 0
-        all_rmsds = Float64[]
-        all_clashes = Int[]
-        all_brmsds = Float64[]
-        for ex in check_pool[1:n_check]
-            x_hat, _ = sample_flow(model, ps_cpu, st_cpu, ex.feat, ex.relpos,
-                                    ex.cond_features, rng; n_steps=20)
-            push!(all_rmsds,   aligned_rmsd(x_hat, Float32.(ex.x1)))
-            push!(all_clashes, clash_count(x_hat, [t.element for t in ex.tokens],
-                                           ex.feat.chain_idx, ex.feat.res_index))
-            push!(all_brmsds,  bond_length_rmsd(x_hat, backbone_bonds(ex.tokens)))
-        end
         wlog(wandb_lg, Dict(
-            "test/mean_rmsd"      => sum(all_rmsds)   / n_check,
-            "test/mean_clashes"   => sum(all_clashes) / n_check,
-            "test/mean_bond_rmsd" => sum(all_brmsds)  / n_check,
+            "test/mean_rmsd"             => sum(unguided_rmsds)   / n_check,
+            "test/mean_clashes"          => sum(unguided_clashes) / n_check,
+            "test/mean_bond_rmsd"        => sum(unguided_brmsds)  / n_check,
+            "test/guided_mean_rmsd"      => sum(guided_rmsds)     / n_check,
+            "test/guided_mean_clashes"   => sum(guided_clashes)   / n_check,
+            "test/guided_mean_bond_rmsd" => sum(guided_brmsds)    / n_check,
         ))
     end
 
