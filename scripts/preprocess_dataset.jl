@@ -136,13 +136,23 @@ function main(args=ARGS)
             continue
         end
 
+        # Write to a temp file in the same directory, then rename into place
+        # only once the write has fully succeeded. A rename on the same
+        # filesystem is atomic, so out_path only ever exists in a complete
+        # state -- if this process gets killed mid-write (OOM, a job time
+        # limit, a manual interrupt, an NFS hiccup), there's no truncated
+        # file left behind under the real name to be mistaken for "done" by
+        # the isfile() check above on a future run.
+        tmp_path = out_path * ".tmp.$(getpid())"
         try
             ex = load_local_example(path)
-            Serialization.serialize(out_path, ex)
+            Serialization.serialize(tmp_path, ex)
+            mv(tmp_path, out_path; force=true)
             n_written += 1
         catch e
             n_failed += 1
             println("  skip $label: $(sprint(showerror, e))")
+            rm(tmp_path; force=true)
         end
     end
 
