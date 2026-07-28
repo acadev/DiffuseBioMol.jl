@@ -78,6 +78,23 @@ combinations against the same larger pool of structures, since --cache-file
 would force a full re-preprocess on every combination change. When both a
 source directory and --library-dir are given, --library-dir wins.
 
+--library-dir loads *lazily*: --n-targets structures are selected using only
+`readdir`/file size (`estimate_n_atoms` — a cheap proxy from the O(n_atoms^2)
+scaling of a library file's size, no data read), and each structure's actual
+data is only read from disk right when a batch containing it is about to be
+used (`materialize`, discarded again once that batch is done). Peak memory
+for the loaded-structures pool is therefore ~`batch_size` structures, not
+`--n-targets` — so `--n-targets` can safely be set arbitrarily high (even to
+cover an entire multi-hundred-thousand-structure library) without the
+process running out of RAM or spilling to disk swap. The trade-off: every
+epoch re-reads its structures from disk rather than reusing an in-memory
+copy, so this shifts cost from "large one-time RAM/disk usage" to "recurring
+per-epoch disk I/O" — the right trade when the former was outright failing
+(OOM, or `--cache-file`/swap filling the disk), which is the situation this
+was built for. The RCSB-fetch and raw-local-directory paths stay fully
+eager (no cheap way to know atom count without actually parsing), which is
+fine at the much smaller scale those are normally used at.
+
 --val-fraction/--test-fraction carve the *loaded* pool (i.e. out of
 --n-targets, before any split — a run with --n-targets 1000 --val-fraction
 0.1 --test-fraction 0.1 trains on 800, not 1000) into the standard
@@ -211,6 +228,48 @@ parsing/tokenizing/featurizing.
 load_library_example(path) = Serialization.deserialize(path)
 
 """
+    LibraryEntry(pdb_id, path, n_atoms)
+
+A *lazy* stand-in for a library structure: just enough to sort/filter/batch
+by (`n_atoms`, for `--max-atoms`) without ever reading the file's actual
+data. `materialize` turns one of these into the real, fully-loaded example
+only when a batch is about to be used — see that function's docstring for
+why this is the fix for large-library RAM/disk pressure.
+"""
+struct LibraryEntry
+    pdb_id::String
+    path::String
+    n_atoms::Int
+end
+
+"""
+    estimate_n_atoms(path) -> Int
+
+Cheap proxy for a serialized library structure's atom count, from file size
+alone (a `stat()` call — no data read, no deserialize). Library files are
+dominated by the O(n_atoms^2) pairwise `relpos` matrix; fitting
+`bytes ≈ 8.4 * n_atoms^2` against real structures gives a consistently tight
+(~5-10%) approximation, plenty accurate for `--max-atoms` filtering without
+paying the cost of actually reading the file.
+"""
+estimate_n_atoms(path) = round(Int, sqrt(filesize(path) / 8.4))
+
+"""
+    materialize(ex) -> NamedTuple
+
+Fully loads a `LibraryEntry` on demand (a real disk read + deserialize);
+returns anything else (an already-fully-loaded example, from the RCSB/local
+-directory eager path) unchanged. Called right before a batch's data is
+actually needed, and only for as long as that call needs it — nothing keeps
+a persistent reference, so materialized examples are eligible for GC as
+soon as the caller is done with them. This is what lets `--library-dir`
+runs keep only `batch_size` structures' worth of real data in memory at
+once, regardless of how large `--n-targets` or the library itself is.
+"""
+materialize(ex::LibraryEntry) = load_library_example(ex.path)
+materialize(ex) = ex
+
+"""
     cache_key(; data_dir, library_dir, n_targets, max_atoms, recursive) -> NamedTuple
 
 The subset of `load_targets`' arguments that determine *which structures* end
@@ -222,29 +281,43 @@ silently reused.
 cache_key(; data_dir, library_dir, n_targets, max_atoms, recursive) =
     (data_dir=data_dir, library_dir=library_dir, n_targets=n_targets, max_atoms=max_atoms, recursive=recursive)
 
-function load_targets(; data_dir, library_dir=nothing, n_targets, max_atoms, recursive, rng, cache_file=nothing)
-    key = cache_key(; data_dir, library_dir, n_targets, max_atoms, recursive)
+"""
+    load_library_targets(library_dir, n_targets, max_atoms, rng) -> Vector{LibraryEntry}
 
-    if cache_file !== nothing && isfile(cache_file)
-        cached = Serialization.deserialize(cache_file)
-        if cached.key == key
-            println("Cache   : loaded $(length(cached.examples)) preprocessed structures from $cache_file (skipped re-parsing)")
-            return cached.examples
-        end
-        @warn "Cache at $cache_file was built with different arguments than this run; re-preprocessing and overwriting it.\n" *
-              "  cached : $(cached.key)\n  current: $key"
+The `--library-dir` path: builds the list of *lazy* `LibraryEntry`s to train
+on using only `readdir`/`filesize` (via `estimate_n_atoms`) — no file's
+actual contents are read here, so this is fast and cheap regardless of how
+large the library or `n_targets` is. Real data only gets read later, one
+batch at a time, via `materialize` (see its docstring).
+"""
+function load_library_targets(library_dir, n_targets, max_atoms, rng)
+    candidates = shuffle(rng, filter(f -> endswith(f, ".jls"), readdir(library_dir; join=true)))
+    isempty(candidates) && throw(ArgumentError(
+        "no preprocessed structures (*.jls) found in $library_dir — " *
+        "run scripts/preprocess_dataset.jl against a source directory first"))
+
+    examples = LibraryEntry[]
+    for path in candidates
+        length(examples) >= n_targets && break
+        n_atoms = estimate_n_atoms(path)
+        max_atoms !== nothing && n_atoms > max_atoms && continue
+        push!(examples, LibraryEntry(splitext(basename(path))[1], path, n_atoms))
     end
+    examples
+end
 
-    if library_dir !== nothing
-        # Already preprocessed by preprocess_dataset.jl — one small file per
-        # structure, decoupled from any run's n_targets/max_atoms, so this is
-        # a plain disk read (deserialize), not a re-parse.
-        candidates = shuffle(rng, filter(f -> endswith(f, ".jls"), readdir(library_dir; join=true)))
-        isempty(candidates) && throw(ArgumentError(
-            "no preprocessed structures (*.jls) found in $library_dir — " *
-            "run scripts/preprocess_dataset.jl against a source directory first"))
-        loader = load_library_example
-    elseif data_dir === nothing
+"""
+    load_eager_targets(data_dir, n_targets, max_atoms, recursive, rng) -> Vector
+
+The RCSB-fetch / raw-local-directory path: unlike `--library-dir`, there's
+no cheap way to know a structure's atom count without actually parsing it,
+so this stays fully eager (parses/tokenizes/featurizes up to `n_targets`
+structures and returns them fully loaded). Fine at the scale these two
+sources are actually used at; `--library-dir` is the path built for
+large-scale data (see `load_library_targets`).
+"""
+function load_eager_targets(data_dir, n_targets, max_atoms, recursive, rng)
+    if data_dir === nothing
         candidates = CANDIDATE_TARGETS
         loader = load_rcsb_example
     else
@@ -266,12 +339,31 @@ function load_targets(; data_dir, library_dir=nothing, n_targets, max_atoms, rec
             println("  skip $label: $(sprint(showerror, e))")
         end
     end
+    examples
+end
+
+function load_targets(; data_dir, library_dir=nothing, n_targets, max_atoms, recursive, rng, cache_file=nothing)
+    key = cache_key(; data_dir, library_dir, n_targets, max_atoms, recursive)
+
+    if cache_file !== nothing && isfile(cache_file)
+        cached = Serialization.deserialize(cache_file)
+        if cached.key == key
+            println("Cache   : loaded $(length(cached.examples)) preprocessed structures from $cache_file (skipped re-listing)")
+            return cached.examples
+        end
+        @warn "Cache at $cache_file was built with different arguments than this run; re-selecting and overwriting it.\n" *
+              "  cached : $(cached.key)\n  current: $key"
+    end
+
+    examples = library_dir !== nothing ?
+        load_library_targets(library_dir, n_targets, max_atoms, rng) :
+        load_eager_targets(data_dir, n_targets, max_atoms, recursive, rng)
 
     if cache_file !== nothing
         cache_dir = dirname(cache_file)
         isempty(cache_dir) || mkpath(cache_dir)
         Serialization.serialize(cache_file, (key=key, examples=examples))
-        println("Cache   : wrote $(length(examples)) preprocessed structures to $cache_file")
+        println("Cache   : wrote $(length(examples)) entries to $cache_file")
     end
 
     examples
@@ -280,6 +372,11 @@ end
 # ── Training step (GPU-aware) ─────────────────────────────────────────────────
 
 function train_on_batch(model, ps, st, opt_state, batch, rng, dev)
+    # Materialize (real disk read, if this batch came from --library-dir)
+    # right here, right before it's needed, and nowhere else -- `batch` goes
+    # out of scope at the end of this call, so this is the only data from it
+    # ever resident in memory at once.
+    batch = materialize.(batch)
     # Build padded batch on CPU — cheap; no GPU needed for padding logic
     bf     = batch_features([ex.feat for ex in batch])
     rp     = batch_relpos([ex.relpos for ex in batch])
@@ -314,6 +411,7 @@ for both the per-epoch val loss and the one-time final test loss, so
 evaluating either can never leak into the trained weights.
 """
 function eval_on_batch(model, ps, st, batch, rng, dev)
+    batch = materialize.(batch)
     bf     = batch_features([ex.feat for ex in batch])
     rp     = batch_relpos([ex.relpos for ex in batch])
     cf     = batch_cond_features([ex.cond_features for ex in batch])
@@ -448,9 +546,10 @@ function main(args=ARGS)
         rng)
     isempty(examples) && error("no structures loaded — check data_dir or network")
     natoms = [ex.n_atoms for ex in examples]
-    @printf("Loaded  : %d structures  %.1fs  (atoms min=%d mean=%.0f max=%d)\n",
+    @printf("Loaded  : %d structures  %.1fs  (atoms min=%d mean=%.0f max=%d%s)\n",
         length(examples), t_load,
-        minimum(natoms), sum(natoms) / length(natoms), maximum(natoms))
+        minimum(natoms), sum(natoms) / length(natoms), maximum(natoms),
+        kw[:library_dir] === nothing ? "" : ", ~ from file size, not yet read")
 
     # ── train/val/test split — the standard three-way split (see module
     # docstring): val is checked every epoch to watch generalization during
@@ -598,6 +697,7 @@ function main(args=ARGS)
     unguided_rmsds, unguided_clashes, unguided_brmsds = Float64[], Int[], Float64[]
     guided_rmsds,   guided_clashes,   guided_brmsds   = Float64[], Int[], Float64[]
     for ex in check_pool[1:n_check]
+        ex = materialize(ex)
         elements = [t.element for t in ex.tokens]
         bonds    = backbone_bonds(ex.tokens)
         centers  = chiral_centers(ex.tokens)
