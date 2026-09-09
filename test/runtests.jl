@@ -12,6 +12,7 @@ include("regression_test.jl")
 include("atomworks_adapter_test.jl")
 include("batching_test.jl")
 include("baseline_pipeline_test.jl")
+include("curate_protein_dataset_test.jl")
 
 @testset "AtomVocab" begin
     @test AtomVocab.residue_modality("ALA") == PROTEIN

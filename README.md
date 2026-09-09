@@ -266,6 +266,30 @@ bond RMSD, chirality violations), final gate outcomes, the config, manifest,
 metrics CSV, and checkpoints. No W&B client is initialized when
 `enabled = false`.
 
+### Constructing a local protein baseline corpus
+
+Stage raw PDB/mmCIF candidates locally, then curate a deterministic,
+largest-chain, standard-protein dataset before training. The curation script
+requires complete backbone coverage and writes source provenance plus FASTA
+sequences for external homology clustering:
+
+```sh
+julia --project=. scripts/curate_protein_dataset.jl /data/pdb-raw /data/pdb10k-candidates \
+  --n-structures=12000 --max-atoms=1200 --min-residues=40 --seed=20260909
+```
+
+Use `sequences.fasta` to select one representative per sequence cluster (for
+example, 30% identity). Feed the representative FASTA back into the same
+script to materialize only cluster representatives in the final 10k directory:
+
+```sh
+julia --project=. scripts/curate_protein_dataset.jl /data/pdb10k-candidates /data/pdb10k-final \
+  --n-structures=10000 --max-atoms=1200 --min-residues=40 --seed=20260909 \
+  --representatives-fasta=/data/mmseqs/cluster_rep_seq.fasta
+```
+
+Point `configs/h100_10k.toml`'s `data.data_dir` at that final directory.
+
 # Real-PDB Phase 1 training smoke test (needs network access to RCSB):
 julia --project=. scripts/train_phase1_real_data.jl
 
