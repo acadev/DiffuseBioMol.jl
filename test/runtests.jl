@@ -13,6 +13,7 @@ include("atomworks_adapter_test.jl")
 include("batching_test.jl")
 include("baseline_pipeline_test.jl")
 include("curate_protein_dataset_test.jl")
+include("rcsb_downloader_test.jl")
 
 @testset "AtomVocab" begin
     @test AtomVocab.residue_modality("ALA") == PROTEIN

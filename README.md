@@ -290,6 +290,21 @@ julia --project=. scripts/curate_protein_dataset.jl /data/pdb10k-candidates /dat
 
 Point `configs/h100_10k.toml`'s `data.data_dir` at that final directory.
 
+### Downloading a random RCSB candidate cache
+
+To construct a raw candidate cache directly from RCSB PDB, download a seeded
+sample of experimental protein entries in mmCIF form. The script saves its exact
+selection and resumes from valid cached files on the next invocation:
+
+```sh
+julia --project=. scripts/download_rcsb_dataset.jl /data/rcsb-raw \
+  --n-structures=15000 --seed=20260909 --retries=3
+```
+
+Then use `/data/rcsb-raw` as the input to `curate_protein_dataset.jl`. Keep
+the generated `sampled_ids.txt` and `download_manifest.toml` with the run for
+reproducibility.
+
 # Real-PDB Phase 1 training smoke test (needs network access to RCSB):
 julia --project=. scripts/train_phase1_real_data.jl
 
