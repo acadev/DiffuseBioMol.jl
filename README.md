@@ -250,6 +250,22 @@ julia --project=. -e 'using Pkg; Pkg.add("CUDA")'
 # Copy configs/h100_10k.toml, set data.data_dir, then launch:
 julia --project=. scripts/train_baseline.jl configs/h100_10k.toml runs/h100-10k --gpu
 
+### Weights & Biases
+
+The baseline runner logs local CSV/TOML artifacts by default. To mirror a run
+to W&B, set `[wandb].enabled = true`, choose its project/entity/name in the
+same config, and provide the API key only through the job environment:
+
+```sh
+export WANDB_API_KEY='...'
+julia --project=. scripts/train_baseline.jl configs/h100_10k.toml runs/h100-10k --gpu
+```
+
+It records CFM loss, sentinel/full validation aggregates (RMSD, clashes,
+bond RMSD, chirality violations), final gate outcomes, the config, manifest,
+metrics CSV, and checkpoints. No W&B client is initialized when
+`enabled = false`.
+
 # Real-PDB Phase 1 training smoke test (needs network access to RCSB):
 julia --project=. scripts/train_phase1_real_data.jl
 

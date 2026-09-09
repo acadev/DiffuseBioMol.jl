@@ -32,3 +32,11 @@ sentinel_size = 32
 full_validation_every = 25
 # A trained model must improve over its initialization by at least this many Å.
 min_rmsd_improvement = 0.0
+
+[wandb]
+# Set enabled=true and export WANDB_API_KEY on the training host to use W&B.
+enabled = false
+project = "DiffuseBioMol"
+entity = "" # optional W&B team/entity
+name = ""   # empty uses the run-directory name
+upload_checkpoints = true

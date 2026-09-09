@@ -19,6 +19,11 @@ Metrics are appended to `metrics.csv`, the exact split is saved to
 checkpoint.  Checkpoint state includes model parameters, optimizer state, RNG,
 and the next epoch, so interruption does not change the training trajectory.
 
+Set `[wandb].enabled = true` in the TOML configuration to mirror run metadata,
+epoch losses, validation aggregates, and final gate status to a Weights & Biases
+dashboard. The client is loaded only in that opt-in path; set `WANDB_API_KEY`
+in the job environment rather than storing a credential here.
+
 Geometry reporting is native to this package: clash count, backbone bond RMSD,
 and CA chirality violations. Reconstruction is aligned coordinate RMSD from a
 deterministic flow sample.  A run is eligible for later fast-sampler work only
@@ -48,6 +53,12 @@ end
 
 n_atoms(ex::BaselineExample) = length(ex.tokens)
 
+"""Opt-in W&B handle; `nothing` denotes local-only tracking."""
+struct WandbTracker
+    logger
+    upload_checkpoints::Bool
+end
+
 function require_key(table, key::AbstractString)
     haskey(table, key) || throw(ArgumentError("missing required configuration key `$key`"))
     table[key]
@@ -58,7 +69,7 @@ function load_config(path::AbstractString)
     data, model, training, evaluation = (require_key(config, k) for k in ("data", "model", "training", "evaluation"))
     data_dir = String(require_key(data, "data_dir"))
     isdir(data_dir) || throw(ArgumentError("data.data_dir is not a readable directory: $data_dir"))
-    (data=data, model=model, training=training, evaluation=evaluation, path=abspath(path))
+    (data=data, model=model, training=training, evaluation=evaluation, raw=config, path=abspath(path))
 end
 
 function load_example(path::AbstractString)
@@ -121,6 +132,71 @@ function write_manifest(path::AbstractString, config, training, validation, skip
     open(path, "w") do io
         TOML.print(io, doc)
     end
+end
+
+"""Convert parsed TOML tables to a plain W&B-compatible nested dictionary."""
+wandb_config(config) = Dict(string(k) => v for (k, v) in config)
+
+function start_wandb(config, run_dir::AbstractString, training, validation, sentinel)
+    wandb_cfg = get(config.raw, "wandb", Dict{String,Any}())
+    Bool(get(wandb_cfg, "enabled", false)) || return nothing
+    haskey(ENV, "WANDB_API_KEY") || error("[wandb].enabled=true requires WANDB_API_KEY in the job environment")
+    Base.find_package("Wandb") === nothing && error("Wandb.jl is not available; run `Pkg.add(\"Wandb\")` in this project")
+    @eval import Wandb
+
+    name = String(get(wandb_cfg, "name", ""))
+    isempty(name) && (name = basename(abspath(run_dir)))
+    kwargs = Dict{Symbol,Any}(
+        :project => String(get(wandb_cfg, "project", "DiffuseBioMol")),
+        :name => name,
+        :config => wandb_config(config.raw),
+    )
+    entity = String(get(wandb_cfg, "entity", ""))
+    isempty(entity) || (kwargs[:entity] = entity)
+    logger = Wandb.WandbLogger(; kwargs...)
+    tracker = WandbTracker(logger, Bool(get(wandb_cfg, "upload_checkpoints", true)))
+    Wandb.log(logger, Dict(
+        "dataset/usable_structures" => length(training) + length(validation),
+        "dataset/training_structures" => length(training),
+        "dataset/validation_structures" => length(validation),
+        "dataset/sentinel_structures" => length(sentinel),
+    ); step=0)
+    Wandb.save(logger, joinpath(run_dir, "manifest.toml"))
+    tracker
+end
+
+log_wandb_epoch!(::Nothing, epoch::Int, train_loss::Real, scope::AbstractString, reports) = nothing
+
+function log_wandb_epoch!(tracker::WandbTracker, epoch::Int, train_loss::Real, scope::AbstractString, reports)
+    metrics = Dict{String,Any}("epoch" => epoch)
+    isfinite(train_loss) && (metrics["training/cfm_loss"] = train_loss)
+    for condition in ("prior", "model", "model_guided")
+        for (metric, value) in aggregate(reports, condition)
+            metrics["validation/$scope/$condition/$metric"] = value
+        end
+    end
+    Wandb.log(tracker.logger, metrics; step=epoch)
+    nothing
+end
+
+log_wandb_gates!(::Nothing, gates) = nothing
+
+function log_wandb_gates!(tracker::WandbTracker, gates)
+    metrics = Dict{String,Any}("gates/$key" => value for (key, value) in gates if value isa Bool)
+    Wandb.log(tracker.logger, metrics)
+    nothing
+end
+
+save_wandb_checkpoint!(::Nothing, path::AbstractString) = nothing
+function save_wandb_checkpoint!(tracker::WandbTracker, path::AbstractString)
+    tracker.upload_checkpoints && Wandb.save(tracker.logger, path)
+    nothing
+end
+
+close_wandb!(::Nothing) = nothing
+function close_wandb!(tracker::WandbTracker)
+    close(tracker.logger)
+    nothing
 end
 
 """Select a fixed, reproducible subset for frequent inexpensive validation."""
@@ -275,6 +351,7 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
     # CPU.  Training can still use one GPU by passing `Lux.gpu_device()` as
     # `device`; parameters are copied back only at checkpoint/evaluation time.
     host_device = Lux.cpu_device()
+    tracker = start_wandb(config, run_dir, training, validation, sentinel)
     if resume
         isfile(checkpoint_path) || throw(ArgumentError("--resume requested but $checkpoint_path does not exist"))
         saved = deserialize(checkpoint_path)
@@ -292,6 +369,7 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
         # reconstruction gate compares against the actual initialization.
         initial_reports = evaluate(model, host_device(ps), host_device(st), validation, seed, Int(require_key(eval_cfg, "sample_steps")))
         append_metrics(joinpath(run_dir, "metrics.csv"), 0, NaN, "full_initial", initial_reports)
+        log_wandb_epoch!(tracker, 0, NaN, "full_initial", initial_reports)
     end
 
     epochs, checkpoint_every = Int(require_key(training_cfg, "epochs")), Int(require_key(training_cfg, "checkpoint_every"))
@@ -311,14 +389,22 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
             eval_examples, scope = full ? (validation, "full") : (sentinel, "sentinel")
             final_reports = evaluate(model, host_device(ps), host_device(st), eval_examples, seed, Int(require_key(eval_cfg, "sample_steps")))
             append_metrics(joinpath(run_dir, "metrics.csv"), epoch, train_loss, scope, final_reports)
+            log_wandb_epoch!(tracker, epoch, train_loss, scope, final_reports)
             checkpoint(checkpoint_path, epoch, host_device(ps), host_device(st), host_device(opt_state), rng,
                 abspath(config_path), initial_reports)
+            save_wandb_checkpoint!(tracker, checkpoint_path)
         end
     end
     gates = gate_report(initial_reports, final_reports, Float64(require_key(eval_cfg, "min_rmsd_improvement")))
     open(joinpath(run_dir, "gates.toml"), "w") do io
         TOML.print(io, gates)
     end
+    log_wandb_gates!(tracker, gates)
+    if tracker !== nothing
+        Wandb.save(tracker.logger, joinpath(run_dir, "metrics.csv"))
+        Wandb.save(tracker.logger, joinpath(run_dir, "gates.toml"))
+    end
+    close_wandb!(tracker)
     println("Gate result: all_passed = $(gates["all_passed"]) (see $(joinpath(run_dir, "gates.toml"))).")
     gates["all_passed"] || println("Baseline did not clear gates; do not start fast-sampler work from this checkpoint.")
     (model=model, ps=ps, st=st, gates=gates)

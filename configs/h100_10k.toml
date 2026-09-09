@@ -35,3 +35,10 @@ sample_steps = 40
 sentinel_size = 64
 full_validation_every = 25
 min_rmsd_improvement = 0.0
+
+[wandb]
+enabled = true
+project = "DiffuseBioMol"
+entity = "" # set this to your W&B team/entity if applicable
+name = "h100-10k-baseline"
+upload_checkpoints = true
