@@ -1,0 +1,37 @@
+# H100 single-device 10k-structure baseline. Copy this file and edit only
+# `data_dir` before launching. The runner rejects a corpus with fewer than
+# 10,000 usable structures and deterministically samples exactly 10,000 if
+# the directory contains more.
+
+[data]
+data_dir = "CHANGE_ME_TO_A_LOCAL_10K_PDB_DIRECTORY"
+max_atoms = 1200
+max_structures = 10000
+min_structures = 10000
+validation_fraction = 0.15
+
+[model]
+# A meaningful, still conservative baseline: 4 Pairformer-lite and 4 DiT
+# blocks. Increase only after this profile clears its held-out gates.
+d_single = 64
+d_pair = 32
+n_heads = 8
+n_pairformer_layers = 4
+n_dit_layers = 4
+d_time = 64
+d_hidden_mult = 4
+
+[training]
+seed = 20260909
+epochs = 50
+batch_size = 8
+learning_rate = 0.001
+checkpoint_every = 5
+
+[evaluation]
+sample_steps = 40
+# The same fixed 64 structures are evaluated at ordinary checkpoints; all
+# 1,500 held-out structures are evaluated every 25 epochs and at epoch 50.
+sentinel_size = 64
+full_validation_every = 25
+min_rmsd_improvement = 0.0

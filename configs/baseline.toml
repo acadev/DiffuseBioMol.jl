@@ -1,0 +1,34 @@
+# Reproducible single-device baseline. Point `data_dir` at a local PDB/mmCIF
+# corpus; its files are deterministically split by `seed` and recorded in the
+# run manifest. Start small on CPU, then use the runner's `--gpu` flag after
+# installing CUDA.jl to train on one GPU.
+
+[data]
+data_dir = "CHANGE_ME_TO_A_LOCAL_PDB_DIRECTORY"
+max_atoms = 1200
+max_structures = 0 # 0 means use every usable structure
+min_structures = 3
+validation_fraction = 0.15
+
+[model]
+d_single = 32
+d_pair = 16
+n_heads = 4
+n_pairformer_layers = 2
+n_dit_layers = 2
+d_time = 32
+d_hidden_mult = 4
+
+[training]
+seed = 0
+epochs = 50
+batch_size = 4
+learning_rate = 0.001
+checkpoint_every = 5
+
+[evaluation]
+sample_steps = 40
+sentinel_size = 32
+full_validation_every = 25
+# A trained model must improve over its initialization by at least this many Å.
+min_rmsd_improvement = 0.0

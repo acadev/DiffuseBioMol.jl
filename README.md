@@ -237,6 +237,19 @@ CASP15 RNA / DockQ protein-complex accuracy against literature numbers.
 ```sh
 julia --project=. -e 'using Pkg; Pkg.test()'
 
+# Reproducible single-device baseline (copy and edit configs/baseline.toml
+# to point data.data_dir at a local PDB/mmCIF corpus):
+julia --project=. scripts/train_baseline.jl configs/baseline.toml runs/baseline
+# Resume exactly from the latest model/optimizer/RNG checkpoint:
+julia --project=. scripts/train_baseline.jl configs/baseline.toml runs/baseline --resume
+# Optional, with CUDA.jl installed in the active Julia environment:
+julia --project=. scripts/train_baseline.jl configs/baseline.toml runs/baseline --gpu
+
+# H100 10k-structure profile (requires CUDA.jl in this project's environment):
+julia --project=. -e 'using Pkg; Pkg.add("CUDA")'
+# Copy configs/h100_10k.toml, set data.data_dir, then launch:
+julia --project=. scripts/train_baseline.jl configs/h100_10k.toml runs/h100-10k --gpu
+
 # Real-PDB Phase 1 training smoke test (needs network access to RCSB):
 julia --project=. scripts/train_phase1_real_data.jl
 
