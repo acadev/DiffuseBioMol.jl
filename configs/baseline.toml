@@ -6,6 +6,12 @@
 [data]
 data_dir = "CHANGE_ME_TO_A_LOCAL_PDB_DIRECTORY"
 max_atoms = 1200
+# Defaults to `RUN_DIR/corpus_cache.jls`. Set an absolute path shared by runs
+# to reuse parsed/tokenized structures across hyperparameter experiments.
+# cache_path = "/scratch/diffusebiomol/corpus-max1200.jls"
+load_progress_every = 25
+# 0 parses every source file. Set a bound before pointing at a large raw mirror.
+max_candidate_files = 0
 max_structures = 0 # 0 means use every usable structure
 min_structures = 3
 validation_fraction = 0.15

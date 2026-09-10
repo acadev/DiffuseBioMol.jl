@@ -250,6 +250,35 @@ julia --project=. -e 'using Pkg; Pkg.add("CUDA")'
 # Copy configs/h100_10k.toml, set data.data_dir, then launch:
 julia --project=. scripts/train_baseline.jl configs/h100_10k.toml runs/h100-10k --gpu
 
+### Large-corpus loading
+
+The baseline runner parses and tokenizes each coordinate file once, then writes
+`corpus_cache.jls` under the run directory. A restart reuses it without
+re-parsing. For the same curated corpus across multiple experiments, set
+`data.cache_path` to one absolute path on shared scratch storage (for example,
+`/scratch/diffusebiomol/pdb10k-max1200.jls`). The cache is accepted only when
+the selected source paths, sizes, modification times, atom cap, and candidate
+selection settings exactly match; it otherwise rebuilds rather than using stale
+structures. `data.load_progress_every` controls periodic parse-progress messages
+(default: 25 files).
+
+When `data_dir` is a large mirror, set `data.max_candidate_files` before the
+first build. The runner deterministically samples that many filenames using the
+training seed *before* parsing, rather than parsing an entire mirror only to
+discard most examples later. The 10k H100 profile uses 12,000 candidates to
+leave room for invalid or over-budget entries; use a curated corpus with at
+least 10,000 valid structures for that profile.
+
+The first build remains CPU-bound because every mmCIF must be parsed once;
+schedule it before occupying an H100 allocation when possible. Later training
+and resumed runs incur only cache deserialization.
+
+Build the cache without initializing CUDA, W&B, or training:
+
+```sh
+julia --project=. scripts/train_baseline.jl configs/h100_10k.toml runs/h100-10k --prepare-only
+```
+
 ### Weights & Biases
 
 The baseline runner logs local CSV/TOML artifacts by default. To mirror a run

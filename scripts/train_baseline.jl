@@ -11,6 +11,7 @@ Usage:
     julia --project=. scripts/train_baseline.jl configs/baseline.toml runs/baseline
     julia --project=. scripts/train_baseline.jl configs/baseline.toml runs/baseline --resume
     julia --project=. scripts/train_baseline.jl configs/baseline.toml runs/baseline --gpu
+    julia --project=. scripts/train_baseline.jl configs/baseline.toml runs/baseline --prepare-only
 
 The default configuration deliberately has a placeholder `data_dir`; copy it
 and point it at a local, immutable corpus before running a real experiment.
@@ -18,6 +19,12 @@ Metrics are appended to `metrics.csv`, the exact split is saved to
 `manifest.toml`, and `checkpoint_latest.jls` is atomically replaced after each
 checkpoint.  Checkpoint state includes model parameters, optimizer state, RNG,
 and the next epoch, so interruption does not change the training trajectory.
+
+The parsed/tokenized corpus is cached as `corpus_cache.jls` in the run
+directory by default. Re-launching the same run, or pointing another run at a
+shared `data.cache_path`, reuses that cache whenever the source file paths,
+sizes, modification times, and `max_atoms` match. This avoids re-parsing
+mmCIF files on every training attempt.
 
 Set `[wandb].enabled = true` in the TOML configuration to mirror run metadata,
 epoch losses, validation aggregates, and final gate status to a Weights & Biases
@@ -37,6 +44,7 @@ using TOML, Serialization, Statistics, Printf, Dates
 import Wandb
 
 const Lux = DiffuseBioMol.Model.Network.Lux
+const CORPUS_CACHE_VERSION = 2
 
 """One loaded structure plus all immutable metadata needed by training/eval."""
 struct BaselineExample
@@ -87,13 +95,70 @@ function load_example(path::AbstractString)
     )
 end
 
-"""Load the fixed corpus once; malformed/oversized records are reported and skipped."""
-function load_corpus(data_dir::AbstractString; max_atoms::Int)
+"""A cheap, deterministic fingerprint for invalidating a preprocessed corpus cache."""
+function corpus_signature(files)
+    [(path=abspath(path), size=filesize(path), mtime=stat(path).mtime) for path in files]
+end
+
+function load_cached_corpus(cache_path::AbstractString, signature, max_atoms::Int,
+                            max_candidate_files::Int, selection_seed::Int)
+    isfile(cache_path) || return nothing
+    try
+        cached = deserialize(cache_path)
+        if cached.version == CORPUS_CACHE_VERSION && cached.max_atoms == max_atoms &&
+           cached.max_candidate_files == max_candidate_files && cached.selection_seed == selection_seed &&
+           cached.signature == signature
+            println("Corpus cache: loaded $(length(cached.examples)) usable structures from $cache_path.")
+            return cached.examples, cached.skipped
+        end
+        println("Corpus cache: source files or max_atoms changed; rebuilding $cache_path.")
+    catch err
+        @warn "Corpus cache at $cache_path could not be read; rebuilding it" exception=(err, catch_backtrace())
+    end
+    nothing
+end
+
+function write_corpus_cache(cache_path::AbstractString, signature, max_atoms::Int,
+                            max_candidate_files::Int, selection_seed::Int, examples, skipped)
+    parent = dirname(cache_path)
+    isempty(parent) || mkpath(parent)
+    temporary = cache_path * ".tmp.$(getpid()).$(rand(UInt))"
+    try
+        serialize(temporary, (version=CORPUS_CACHE_VERSION, signature=signature,
+            max_atoms=max_atoms, max_candidate_files=max_candidate_files,
+            selection_seed=selection_seed, examples=examples, skipped=skipped))
+        mv(temporary, cache_path; force=true)
+    finally
+        isfile(temporary) && rm(temporary; force=true)
+    end
+    println("Corpus cache: wrote $(length(examples)) usable structures to $cache_path.")
+end
+
+"""Load a fixed corpus with observable progress and optional persistent preprocessing cache."""
+function load_corpus(data_dir::AbstractString; max_atoms::Int, cache_path::Union{Nothing,AbstractString}=nothing,
+                     progress_every::Int=25, max_candidate_files::Int=0, selection_seed::Int=0)
     files = list_structure_files(data_dir; recursive=true)
     isempty(files) && throw(ArgumentError("no PDB/mmCIF files found under $data_dir"))
+    progress_every > 0 || throw(ArgumentError("progress_every must be positive"))
+    max_candidate_files >= 0 || throw(ArgumentError("max_candidate_files must be nonnegative"))
+    if max_candidate_files > 0 && length(files) > max_candidate_files
+        selection = randperm(MersenneTwister(selection_seed), length(files))[1:max_candidate_files]
+        files = sort(files[selection])
+        println("Corpus loading: selected $max_candidate_files candidate files deterministically from the source corpus.")
+    end
+    signature = corpus_signature(files)
+    if cache_path !== nothing
+        cached = load_cached_corpus(cache_path, signature, max_atoms, max_candidate_files, selection_seed)
+        cached === nothing || return cached
+    end
+
+    println("Corpus loading: parsing $(length(files)) files from $data_dir (progress every $progress_every files).")
     examples = BaselineExample[]
     skipped = String[]
-    for path in files
+    for (i, path) in enumerate(files)
+        if i == 1 || i % progress_every == 0 || i == length(files)
+            println("Corpus loading: file $i/$(length(files)) ($(basename(path))); $(length(examples)) usable so far.")
+        end
         try
             ex = load_example(path)
             if n_atoms(ex) <= max_atoms
@@ -106,6 +171,8 @@ function load_corpus(data_dir::AbstractString; max_atoms::Int)
         end
     end
     isempty(examples) && error("no usable structures in $data_dir")
+    cache_path === nothing || write_corpus_cache(cache_path, signature, max_atoms,
+        max_candidate_files, selection_seed, examples, skipped)
     examples, skipped
 end
 
@@ -319,13 +386,18 @@ function selected_device(use_gpu::Bool)
     Lux.gpu_device()
 end
 
-function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool=false, device=identity)
+function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool=false, prepare_only::Bool=false, device=identity)
     config = load_config(config_path)
     mkpath(run_dir)
     data, training_cfg, eval_cfg = config.data, config.training, config.evaluation
     seed = Int(require_key(training_cfg, "seed"))
     rng = MersenneTwister(seed)
-    examples, skipped = load_corpus(String(require_key(data, "data_dir")); max_atoms=Int(require_key(data, "max_atoms")))
+    configured_cache = String(get(data, "cache_path", joinpath(run_dir, "corpus_cache.jls")))
+    cache_path = isempty(configured_cache) ? nothing : abspath(configured_cache)
+    examples, skipped = load_corpus(String(require_key(data, "data_dir"));
+        max_atoms=Int(require_key(data, "max_atoms")), cache_path,
+        progress_every=Int(get(data, "load_progress_every", 25)),
+        max_candidate_files=Int(get(data, "max_candidate_files", 0)), selection_seed=seed)
     max_structures = Int(get(data, "max_structures", 0))
     if max_structures > 0 && length(examples) > max_structures
         examples = sort(examples; by = ex -> ex.source)[randperm(MersenneTwister(seed), length(examples))[1:max_structures]]
@@ -336,6 +408,11 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
     sentinel = validation_sentinel(validation, Int(get(eval_cfg, "sentinel_size", length(validation))), seed + 1)
     write_manifest(joinpath(run_dir, "manifest.toml"), config, training, validation, skipped; sentinel)
     println("Loaded $(length(examples)) usable structures: $(length(training)) train, $(length(validation)) validation; $(length(skipped)) skipped.")
+    if prepare_only
+        resume && throw(ArgumentError("--prepare-only cannot be combined with --resume"))
+        println("Corpus preparation complete; cache is ready for a later training launch.")
+        return (training=training, validation=validation, sentinel=sentinel, skipped=skipped)
+    end
 
     m = config.model
     model = build_model(ModelConfig(
@@ -410,6 +487,9 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    length(ARGS) >= 2 || error("usage: julia --project=. scripts/train_baseline.jl CONFIG.toml RUN_DIR [--resume]")
-    main(ARGS[1], ARGS[2]; resume="--resume" in ARGS[3:end], device=selected_device("--gpu" in ARGS[3:end]))
+    length(ARGS) >= 2 || error("usage: julia --project=. scripts/train_baseline.jl CONFIG.toml RUN_DIR [--resume] [--prepare-only] [--gpu]")
+    flags = ARGS[3:end]
+    prepare_only = "--prepare-only" in flags
+    main(ARGS[1], ARGS[2]; resume="--resume" in flags, prepare_only,
+        device=selected_device("--gpu" in flags && !prepare_only))
 end
