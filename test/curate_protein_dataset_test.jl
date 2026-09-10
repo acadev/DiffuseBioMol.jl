@@ -16,12 +16,14 @@ using .CurateProteinDataset
         @test candidate.n_residues == 2
         @test candidate.backbone_coverage == 1.0
 
-        selected = curate(input_dir, output_dir; n_structures=2, seed=1, max_atoms=100, min_residues=1)
+        selected = curate(input_dir, output_dir; n_structures=2, seed=1, max_atoms=100, min_residues=1, concurrency=2)
         @test length(selected) == 2
         @test length(filter(f -> endswith(f, ".pdb"), readdir(output_dir))) == 2
         @test isfile(joinpath(output_dir, "manifest.toml"))
         @test isfile(joinpath(output_dir, "sequences.fasta"))
-        @test length(TOML.parsefile(joinpath(output_dir, "manifest.toml"))["selected"]) == 2
+        manifest = TOML.parsefile(joinpath(output_dir, "manifest.toml"))
+        @test length(manifest["selected"]) == 2
+        @test manifest["options"]["concurrency"] == 2
 
         representatives = joinpath(root, "representatives.fasta")
         write(representatives, ">CURATED_00001|$(first(selected).label)|chain=A\nAG\n")

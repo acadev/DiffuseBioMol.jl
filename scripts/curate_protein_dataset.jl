@@ -4,8 +4,8 @@ Build a reproducible protein-chain corpus from a locally staged PDB/mmCIF tree.
 This script is deliberately download-free: stage candidate coordinate files on
 the training filesystem first, then run, for example:
 
-    julia --project=. scripts/curate_protein_dataset.jl /data/pdb-raw /data/pdb10k \
-        --n-structures=12000 --max-atoms=1200 --seed=20260909
+    JULIA_NUM_THREADS=16 julia --project=. scripts/curate_protein_dataset.jl /data/pdb-raw /data/pdb10k \
+        --n-structures=12000 --max-atoms=1200 --seed=20260909 --concurrency=16
 
 The output directory must not already contain files. Every selected source file
 is copied with a deterministic name; `manifest.toml` records its source and
@@ -109,7 +109,7 @@ end
 """
     curate(input_dir, output_dir; n_structures=12000, seed=20260909,
            max_atoms=1200, min_residues=40, min_backbone_coverage=0.95,
-           skip_nmr=true) -> Vector{CuratedCandidate}
+           skip_nmr=true, concurrency=1) -> Vector{CuratedCandidate}
 
 Inspect every supported coordinate file recursively, then deterministically
 sample up to `n_structures` accepted chains and copy the source coordinate
@@ -128,10 +128,56 @@ function representative_prefixes(path::AbstractString)
     prefixes
 end
 
+"""Inspect independent coordinate files concurrently, retaining source-list order in results."""
+function inspect_files(files; max_atoms::Int, min_residues::Int, min_backbone_coverage::Real,
+                       skip_nmr::Bool, concurrency::Int)
+    concurrency > 0 || throw(ArgumentError("concurrency must be positive"))
+    n_workers = min(concurrency, length(files))
+    n_workers > Threads.nthreads() && @warn "curation concurrency exceeds JULIA_NUM_THREADS; workers will not run in parallel" concurrency threads=Threads.nthreads()
+    println("Inspecting $(length(files)) coordinate files with $n_workers worker$(n_workers == 1 ? "" : "s").")
+    jobs = Channel{Tuple{Int,String}}(length(files))
+    results = Channel{Any}(length(files))
+    for job in enumerate(files)
+        put!(jobs, job)
+    end
+    close(jobs)
+    workers = [Threads.@spawn begin
+        for (i, path) in jobs
+            try
+                candidate = inspect_candidate(path; max_atoms, min_residues, min_backbone_coverage, skip_nmr)
+                put!(results, (i=i, candidate=candidate, skipped=nothing))
+            catch err
+                put!(results, (i=i, candidate=nothing, skipped="$path ($(sprint(showerror, err)))"))
+            end
+        end
+    end for _ in 1:n_workers]
+
+    outcomes = Vector{Any}(undef, length(files))
+    for completed in 1:length(files)
+        outcome = take!(results)
+        outcomes[outcome.i] = outcome
+        (completed % 1_000 == 0 || completed == length(files)) &&
+            println("Curation inspection: $completed / $(length(files)) files complete.")
+    end
+    foreach(fetch, workers)
+    accepted = CuratedCandidate[]
+    skipped = String[]
+    for (path, outcome) in zip(files, outcomes)
+        if outcome.candidate !== nothing
+            push!(accepted, outcome.candidate)
+        elseif outcome.skipped !== nothing
+            push!(skipped, outcome.skipped)
+        else
+            push!(skipped, "$path (did not meet curation criteria)")
+        end
+    end
+    accepted, skipped
+end
+
 function curate(input_dir::AbstractString, output_dir::AbstractString; n_structures::Int=12_000,
     seed::Int=20_260_909, max_atoms::Int=1200, min_residues::Int=40,
     min_backbone_coverage::Real=0.95, skip_nmr::Bool=true,
-    representatives_fasta::Union{Nothing,AbstractString}=nothing)
+    representatives_fasta::Union{Nothing,AbstractString}=nothing, concurrency::Int=1)
     isdir(input_dir) || throw(ArgumentError("input directory does not exist: $input_dir"))
     abspath(input_dir) == abspath(output_dir) && throw(ArgumentError("input and output directories must differ"))
     isdir(output_dir) && !isempty(readdir(output_dir)) && throw(ArgumentError("output directory must be empty: $output_dir"))
@@ -139,22 +185,13 @@ function curate(input_dir::AbstractString, output_dir::AbstractString; n_structu
     0 < min_backbone_coverage <= 1 || throw(ArgumentError("min_backbone_coverage must lie in (0, 1]"))
     mkpath(output_dir)
 
-    accepted = CuratedCandidate[]
-    skipped = String[]
     files = list_structure_files(input_dir; recursive=true)
     if representatives_fasta !== nothing
         prefixes = representative_prefixes(representatives_fasta)
         files = filter(path -> any(prefix -> startswith(basename(path), prefix), prefixes), files)
         isempty(files) && error("no coordinate files in $input_dir matched $representatives_fasta")
     end
-    for path in files
-        try
-            candidate = inspect_candidate(path; max_atoms, min_residues, min_backbone_coverage, skip_nmr)
-            candidate === nothing ? push!(skipped, "$path (did not meet curation criteria)") : push!(accepted, candidate)
-        catch err
-            push!(skipped, "$path ($err)")
-        end
-    end
+    accepted, skipped = inspect_files(files; max_atoms, min_residues, min_backbone_coverage, skip_nmr, concurrency)
     isempty(accepted) && error("no candidates passed curation from $input_dir")
     ordered = sort(accepted; by = c -> c.source)
     selected = ordered[randperm(MersenneTwister(seed), length(ordered))[1:min(n_structures, length(ordered))]]
@@ -167,7 +204,8 @@ function curate(input_dir::AbstractString, output_dir::AbstractString; n_structu
         "input_dir" => abspath(input_dir), "n_structures_requested" => n_structures,
         "n_structures_selected" => length(selected), "seed" => seed, "max_atoms" => max_atoms,
         "min_residues" => min_residues, "min_backbone_coverage" => Float64(min_backbone_coverage),
-        "skip_nmr" => skip_nmr, "representatives_fasta" => something(representatives_fasta, ""),
+        "skip_nmr" => skip_nmr, "concurrency" => concurrency,
+        "representatives_fasta" => something(representatives_fasta, ""),
     )
     curate_write_manifest(joinpath(output_dir, "manifest.toml"), selected, skipped, options)
     write_fasta(joinpath(output_dir, "sequences.fasta"), selected)
@@ -177,9 +215,9 @@ function curate(input_dir::AbstractString, output_dir::AbstractString; n_structu
 end
 
 function main(args=ARGS)
-    length(args) >= 2 || error("usage: julia --project=. scripts/curate_protein_dataset.jl INPUT_DIR OUTPUT_DIR [--n-structures=N] [--max-atoms=N] [--min-residues=N] [--seed=N]")
+    length(args) >= 2 || error("usage: julia --project=. scripts/curate_protein_dataset.jl INPUT_DIR OUTPUT_DIR [--n-structures=N] [--max-atoms=N] [--min-residues=N] [--seed=N] [--concurrency=N]")
     input_dir, output_dir = args[1], args[2]
-    options = Dict{String,Int}("n-structures" => 12_000, "max-atoms" => 1200, "min-residues" => 40, "seed" => 20_260_909)
+    options = Dict{String,Int}("n-structures" => 12_000, "max-atoms" => 1200, "min-residues" => 40, "seed" => 20_260_909, "concurrency" => 1)
     representatives_fasta = nothing
     for arg in args[3:end]
         startswith(arg, "--") && occursin('=', arg) || error("invalid option: $arg")
@@ -192,7 +230,8 @@ function main(args=ARGS)
         end
     end
     curate(input_dir, output_dir; n_structures=options["n-structures"], max_atoms=options["max-atoms"],
-        min_residues=options["min-residues"], seed=options["seed"], representatives_fasta)
+        min_residues=options["min-residues"], seed=options["seed"], representatives_fasta,
+        concurrency=options["concurrency"])
 end
 
 end # module CurateProteinDataset

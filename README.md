@@ -303,9 +303,14 @@ requires complete backbone coverage and writes source provenance plus FASTA
 sequences for external homology clustering:
 
 ```sh
-julia --project=. scripts/curate_protein_dataset.jl /data/pdb-raw /data/pdb10k-candidates \
-  --n-structures=12000 --max-atoms=1200 --min-residues=40 --seed=20260909
+JULIA_NUM_THREADS=16 julia --project=. scripts/curate_protein_dataset.jl /data/pdb-raw /data/pdb10k-candidates \
+  --n-structures=12000 --max-atoms=1200 --min-residues=40 --seed=20260909 --concurrency=16
 ```
+
+`--concurrency` parallelizes only independent coordinate-file inspection
+(reading, parsing, and tokenizing). Set `JULIA_NUM_THREADS` to at least the
+same value. Sampling, provenance, FASTA generation, and copies remain ordered
+and deterministic.
 
 Use `sequences.fasta` to select one representative per sequence cluster (for
 example, 30% identity). Feed the representative FASTA back into the same
