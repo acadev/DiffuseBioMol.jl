@@ -31,6 +31,13 @@ include(joinpath(@__DIR__, "..", "scripts", "train_baseline.jl"))
         @test only(epoch_a).source == source.source
         @test only(epoch_b).source == source.source
         @test only(epoch_a).label != only(epoch_b).label
+        fixed = infill_fixed_mask(source, 0.5, MersenneTwister(9))
+        @test any(fixed)
+        @test any(.!fixed .& .!source.feat.is_virtual)
+        infill_cond, infill_fixed, fixed_coord = infill_conditioning(source, 0.5, MersenneTwister(9))
+        @test infill_fixed == fixed
+        @test all(infill_cond[1, :] .== Float32.(fixed))
+        @test fixed_coord == Float32.(source.x1)
         crop_sources, _ = load_corpus(data_dir; max_atoms=cap, oversize_policy="crop", progress_every=1)
         @test length(crop_sources) == 3
         crop_train, crop_val = split_examples(crop_sources, 7, 0.34)
@@ -90,5 +97,9 @@ include(joinpath(@__DIR__, "..", "scripts", "train_baseline.jl"))
         @test gates["trained_beats_prior_on_all_metrics"]
         @test gates["guidance_non_regression"]
         @test gates["all_passed"]
+        infill_initial = [(label="x", n_atoms=9, fixed_atoms=2, generated_atoms=7, generated_rmsd=10.0, fixed_rmsd=0.0)]
+        infill_final = [(label="x", n_atoms=9, fixed_atoms=2, generated_atoms=7, generated_rmsd=8.0, fixed_rmsd=0.0)]
+        infill_gates = gate_report(initial, final, 0.1; initial_infill=infill_initial, final_infill=infill_final)
+        @test infill_gates["infill_reconstruction_pass"]
     end
 end

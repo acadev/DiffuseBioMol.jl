@@ -313,9 +313,18 @@ julia --project=. scripts/train_baseline.jl configs/h100_10k.toml runs/h100-10k 
 ```
 
 It records CFM loss, sentinel/full validation aggregates (RMSD, clashes,
-bond RMSD, chirality violations), final gate outcomes, the config, manifest,
-metrics CSV, and checkpoints. No W&B client is initialized when
+bond RMSD, chirality violations), held-out motif-infill recovery, final gate
+outcomes, the config, manifest, metrics CSV, and checkpoints. No W&B client is initialized when
 `enabled = false`.
+
+### Motif infill evaluation
+
+The H100 profile trains 25% of batches with a contiguous observed residue
+motif clamped as a hard condition. It evaluates a fixed held-out set of 16
+crops by clamping 20% of each crop and reporting recovery RMSD on the remaining
+real atoms in `infill_metrics.csv` and W&B. Fixed-coordinate RMSD is logged as
+a correctness check and should remain numerically zero. The final gate includes
+whether held-out infill recovery improves over epoch zero.
 
 ### Constructing a local protein baseline corpus
 

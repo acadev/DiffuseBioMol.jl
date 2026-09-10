@@ -324,6 +324,14 @@ function log_wandb_epoch!(tracker::WandbTracker, epoch::Int, train_loss::Real, s
     nothing
 end
 
+log_wandb_infill!(::Nothing, epoch::Int, reports) = nothing
+function log_wandb_infill!(tracker::WandbTracker, epoch::Int, reports)
+    metrics = Dict("infill/$key" => value for (key, value) in aggregate_infill(reports))
+    metrics["epoch"] = epoch
+    Wandb.log(tracker.logger, metrics; step=epoch)
+    nothing
+end
+
 log_wandb_gates!(::Nothing, gates) = nothing
 
 function log_wandb_gates!(tracker::WandbTracker, gates)
@@ -359,13 +367,41 @@ function length_bucket_batches(examples, batch_size::Int, rng::AbstractRNG)
     shuffle!(rng, batches)
 end
 
-function train_batch(model, ps, st, opt_state, batch, rng, device)
+"""Select a contiguous, residue-complete observed motif for conditional infilling."""
+function infill_fixed_mask(ex::BaselineExample, fraction::Real, rng::AbstractRNG)
+    0 < fraction < 1 || throw(ArgumentError("infill_fixed_fraction must lie in (0, 1)"))
+    groups = residue_groups(ex)
+    length(groups) >= 2 || return falses(n_atoms(ex))
+    n_groups = clamp(round(Int, fraction * length(groups)), 1, length(groups) - 1)
+    start = rand(rng, 1:(length(groups) - n_groups + 1))
+    fixed = falses(n_atoms(ex))
+    for group in groups[start:start+n_groups-1]
+        for i in group
+            fixed[i] = !ex.tokens[i].is_virtual
+        end
+    end
+    fixed
+end
+
+function infill_conditioning(ex::BaselineExample, fraction::Real, rng::AbstractRNG)
+    fixed = infill_fixed_mask(ex, fraction, rng)
+    constraints = AtomConstraints(fixed, falses(n_atoms(ex)), zeros(Float32, n_atoms(ex)), falses(n_atoms(ex)), Float32.(ex.x1))
+    constraint_features(constraints), fixed, constraints.fixed_coord
+end
+
+function train_batch(model, ps, st, opt_state, batch, rng, device; infill_probability::Real=0.0,
+                     infill_fixed_fraction::Real=0.2)
+    0 <= infill_probability <= 1 || throw(ArgumentError("infill_probability must lie in [0, 1]"))
     batched_feat = batch_features([ex.feat for ex in batch])
     relpos = batch_relpos([ex.relpos for ex in batch])
-    cond = batch_cond_features([ex.cond_features for ex in batch])
+    conditioned = [rand(rng) < infill_probability ? infill_conditioning(ex, infill_fixed_fraction, rng) :
+        (ex.cond_features, falses(n_atoms(ex)), zeros(Float32, 3, n_atoms(ex))) for ex in batch]
+    cond = batch_cond_features(first.(conditioned))
     pad_bias = attention_pad_bias(batched_feat.pad_mask)
     coords = batch_coords([ex.x1 for ex in batch])
-    example = prepare_training_example(batched_feat, coords, cond, rng)
+    is_fixed = reduce(hcat, [vcat(mask, falses(size(coords, 2) - length(mask))) for (_, mask, _) in conditioned])
+    fixed_coord = batch_coords(last.(conditioned))
+    example = prepare_training_example(batched_feat, coords, cond, rng; is_fixed, fixed_coord)
 
     # Sampling the prior/SE(3) augmentation is CPU-side and outside AD; only
     # the differentiable batch is moved to the selected single device.
@@ -410,6 +446,42 @@ function evaluate(model, ps, st, examples, seed::Int, n_steps::Int)
     reports
 end
 
+"""Held-out motif-infill evaluation: fixed residues are clamped, all other real atoms are scored."""
+function evaluate_infill(model, ps, st, examples, seed::Int, n_steps::Int, fixed_fraction::Real)
+    reports = NamedTuple[]
+    for (i, ex) in enumerate(examples)
+        mask_rng = MersenneTwister(seed + 20_000 * i)
+        cond, is_fixed, fixed_coord = infill_conditioning(ex, fixed_fraction, mask_rng)
+        sample_rng = MersenneTwister(seed + 20_000 * i + 1)
+        x, _ = sample_flow(model, ps, st, ex.feat, ex.relpos, cond, sample_rng;
+            n_steps=n_steps, is_fixed, fixed_coord)
+        generated = .!is_fixed .& .!ex.feat.is_virtual
+        generated_rmsd = any(generated) ? sqrt(sum(abs2, Float32.(x[:, generated]) .- Float32.(ex.x1[:, generated])) / count(generated)) : NaN
+        fixed_rmsd = any(is_fixed) ? sqrt(sum(abs2, Float32.(x[:, is_fixed]) .- Float32.(ex.x1[:, is_fixed])) / count(is_fixed)) : NaN
+        push!(reports, (label=ex.label, n_atoms=n_atoms(ex), fixed_atoms=count(is_fixed),
+            generated_atoms=count(generated), generated_rmsd=Float64(generated_rmsd), fixed_rmsd=Float64(fixed_rmsd)))
+    end
+    reports
+end
+
+function aggregate_infill(reports)
+    isempty(reports) && error("no infill reports")
+    Dict("mean_generated_rmsd" => mean(r.generated_rmsd for r in reports),
+        "mean_fixed_rmsd" => mean(r.fixed_rmsd for r in reports),
+        "mean_fixed_atoms" => mean(r.fixed_atoms for r in reports))
+end
+
+function append_infill_metrics(path::AbstractString, epoch::Int, reports)
+    new_file = !isfile(path)
+    open(path, "a") do io
+        new_file && println(io, "epoch,label,n_atoms,fixed_atoms,generated_atoms,generated_rmsd,fixed_rmsd")
+        for r in reports
+            @printf(io, "%d,%s,%d,%d,%d,%.8f,%.8f\n", epoch, r.label, r.n_atoms, r.fixed_atoms,
+                r.generated_atoms, r.generated_rmsd, r.fixed_rmsd)
+        end
+    end
+end
+
 function aggregate(reports, condition::String)
     rows = filter(r -> r.condition == condition, reports)
     isempty(rows) && error("no evaluation rows for $condition")
@@ -433,25 +505,32 @@ function append_metrics(path::AbstractString, epoch::Int, train_loss::Real, scop
     end
 end
 
-function gate_report(initial_reports, final_reports, min_rmsd_improvement::Real)
+function gate_report(initial_reports, final_reports, min_rmsd_improvement::Real; initial_infill=nothing, final_infill=nothing)
     untrained, prior = aggregate(initial_reports, "model"), aggregate(initial_reports, "prior")
     trained, guided = aggregate(final_reports, "model"), aggregate(final_reports, "model_guided")
     reconstruction = trained["mean_rmsd"] <= untrained["mean_rmsd"] - min_rmsd_improvement
     beats_prior = all(trained[k] <= prior[k] for k in ("mean_rmsd", "mean_clashes", "mean_bond_rmsd", "mean_chirality_bad"))
     guidance_safe = all(guided[k] <= trained[k] for k in ("mean_clashes", "mean_bond_rmsd", "mean_chirality_bad"))
+    infill_pass = if initial_infill === nothing || final_infill === nothing
+        true
+    else
+        aggregate_infill(final_infill)["mean_generated_rmsd"] <=
+            aggregate_infill(initial_infill)["mean_generated_rmsd"] - min_rmsd_improvement
+    end
     Dict(
         "initial_untrained" => untrained, "prior" => prior, "final_trained" => trained, "final_guided" => guided,
         "reconstruction_pass" => reconstruction,
         "trained_beats_prior_on_all_metrics" => beats_prior,
         "guidance_non_regression" => guidance_safe,
-        "all_passed" => reconstruction && beats_prior && guidance_safe,
+        "infill_reconstruction_pass" => infill_pass,
+        "all_passed" => reconstruction && beats_prior && guidance_safe && infill_pass,
     )
 end
 
-function checkpoint(path::AbstractString, epoch::Int, ps, st, opt_state, rng, config_path, initial_reports)
+function checkpoint(path::AbstractString, epoch::Int, ps, st, opt_state, rng, config_path, initial_reports, initial_infill)
     temporary = path * ".tmp"
     serialize(temporary, (epoch=epoch, ps=ps, st=st, opt_state=opt_state, rng=rng,
-        config_path=config_path, initial_reports=initial_reports))
+        config_path=config_path, initial_reports=initial_reports, initial_infill=initial_infill))
     mv(temporary, path; force=true)
 end
 
@@ -492,6 +571,10 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
     # leak a different crop into train and validation.
     validation_crops = materialize_crops(validation, Int(require_key(data, "max_atoms")), crop_strategy, seed, 0)
     sentinel = validation_sentinel(validation_crops, Int(get(eval_cfg, "sentinel_size", length(validation_crops))), seed + 1)
+    infill_enabled = Bool(get(eval_cfg, "infill_enabled", false))
+    infill_fixed_fraction = Float64(get(eval_cfg, "infill_fixed_fraction", 0.2))
+    infill_size = Int(get(eval_cfg, "infill_size", min(16, length(validation_crops))))
+    infill_examples = infill_enabled ? validation_sentinel(validation_crops, infill_size, seed + 2) : BaselineExample[]
     write_manifest(joinpath(run_dir, "manifest.toml"), config, training, validation, skipped; sentinel)
     println("Loaded $(length(examples)) usable structures: $(length(training)) train, $(length(validation)) validation; $(length(skipped)) skipped.")
     if prepare_only
@@ -519,8 +602,10 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
         saved = deserialize(checkpoint_path)
         saved.config_path == abspath(config_path) || throw(ArgumentError("checkpoint was created with a different config file"))
         hasproperty(saved, :initial_reports) || error("checkpoint predates baseline-gate support; start a fresh run")
+        infill_enabled && !hasproperty(saved, :initial_infill) && error("checkpoint predates infill evaluation; start a fresh run")
         ps, st, opt_state, rng, start_epoch = device(saved.ps), device(saved.st), device(saved.opt_state), saved.rng, saved.epoch + 1
         initial_reports = saved.initial_reports
+        initial_infill = infill_enabled ? saved.initial_infill : nothing
         println("Resuming from epoch $(saved.epoch).")
     else
         ps, st = Lux.setup(rng, model)
@@ -532,17 +617,25 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
         initial_reports = evaluate(model, host_device(ps), host_device(st), validation_crops, seed, Int(require_key(eval_cfg, "sample_steps")))
         append_metrics(joinpath(run_dir, "metrics.csv"), 0, NaN, "full_initial", initial_reports)
         log_wandb_epoch!(tracker, 0, NaN, "full_initial", initial_reports)
+        initial_infill = infill_enabled ? evaluate_infill(model, host_device(ps), host_device(st), infill_examples,
+            seed, Int(require_key(eval_cfg, "sample_steps")), infill_fixed_fraction) : nothing
+        if initial_infill !== nothing
+            append_infill_metrics(joinpath(run_dir, "infill_metrics.csv"), 0, initial_infill)
+            log_wandb_infill!(tracker, 0, initial_infill)
+        end
     end
 
     epochs, checkpoint_every = Int(require_key(training_cfg, "epochs")), Int(require_key(training_cfg, "checkpoint_every"))
     full_validation_every = Int(get(eval_cfg, "full_validation_every", epochs))
     full_validation_every > 0 || throw(ArgumentError("evaluation.full_validation_every must be positive"))
     final_reports = initial_reports
+    final_infill = initial_infill
     for epoch in start_epoch:epochs
         losses = Float64[]
         epoch_crops = materialize_crops(training, Int(require_key(data, "max_atoms")), crop_strategy, seed, epoch)
         for batch in length_bucket_batches(epoch_crops, Int(require_key(training_cfg, "batch_size")), rng)
-            ps, opt_state, loss = train_batch(model, ps, st, opt_state, batch, rng, device)
+            ps, opt_state, loss = train_batch(model, ps, st, opt_state, batch, rng, device;
+                infill_probability=Float64(get(training_cfg, "infill_probability", 0.0)), infill_fixed_fraction)
             push!(losses, loss)
         end
         train_loss = mean(losses)
@@ -553,18 +646,26 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
             final_reports = evaluate(model, host_device(ps), host_device(st), eval_examples, seed, Int(require_key(eval_cfg, "sample_steps")))
             append_metrics(joinpath(run_dir, "metrics.csv"), epoch, train_loss, scope, final_reports)
             log_wandb_epoch!(tracker, epoch, train_loss, scope, final_reports)
+            final_infill = infill_enabled ? evaluate_infill(model, host_device(ps), host_device(st), infill_examples,
+                seed, Int(require_key(eval_cfg, "sample_steps")), infill_fixed_fraction) : nothing
+            if final_infill !== nothing
+                append_infill_metrics(joinpath(run_dir, "infill_metrics.csv"), epoch, final_infill)
+                log_wandb_infill!(tracker, epoch, final_infill)
+            end
             checkpoint(checkpoint_path, epoch, host_device(ps), host_device(st), host_device(opt_state), rng,
-                abspath(config_path), initial_reports)
+                abspath(config_path), initial_reports, initial_infill)
             save_wandb_checkpoint!(tracker, checkpoint_path)
         end
     end
-    gates = gate_report(initial_reports, final_reports, Float64(require_key(eval_cfg, "min_rmsd_improvement")))
+    gates = gate_report(initial_reports, final_reports, Float64(require_key(eval_cfg, "min_rmsd_improvement"));
+        initial_infill, final_infill=infill_enabled ? final_infill : nothing)
     open(joinpath(run_dir, "gates.toml"), "w") do io
         TOML.print(io, gates)
     end
     log_wandb_gates!(tracker, gates)
     if tracker !== nothing
         Wandb.save(tracker.logger, joinpath(run_dir, "metrics.csv"))
+        isfile(joinpath(run_dir, "infill_metrics.csv")) && Wandb.save(tracker.logger, joinpath(run_dir, "infill_metrics.csv"))
         Wandb.save(tracker.logger, joinpath(run_dir, "gates.toml"))
     end
     close_wandb!(tracker)

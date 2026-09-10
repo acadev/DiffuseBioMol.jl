@@ -35,6 +35,9 @@ epochs = 50
 batch_size = 4
 learning_rate = 0.001
 checkpoint_every = 5
+# Fraction of batches conditioned on a contiguous fixed motif. Keep disabled
+# for the smallest smoke baseline; enable it for meaningful infill evaluation.
+infill_probability = 0.0
 
 [evaluation]
 sample_steps = 40
@@ -42,6 +45,9 @@ sentinel_size = 32
 full_validation_every = 25
 # A trained model must improve over its initialization by at least this many Å.
 min_rmsd_improvement = 0.0
+infill_enabled = false
+infill_fixed_fraction = 0.2
+infill_size = 16
 
 [wandb]
 # Set enabled=true and export WANDB_API_KEY on the training host to use W&B.

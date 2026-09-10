@@ -38,6 +38,9 @@ epochs = 50
 batch_size = 8
 learning_rate = 0.001
 checkpoint_every = 5
+# Train on fixed contiguous motifs often enough for conditional infilling to
+# be in-distribution at evaluation time.
+infill_probability = 0.25
 
 [evaluation]
 sample_steps = 40
@@ -46,6 +49,11 @@ sample_steps = 40
 sentinel_size = 64
 full_validation_every = 25
 min_rmsd_improvement = 0.0
+# Fixed held-out motif evaluation: recover the non-fixed atoms while the motif
+# is clamped exactly. This is reported separately in infill_metrics.csv/W&B.
+infill_enabled = true
+infill_fixed_fraction = 0.2
+infill_size = 16
 
 [wandb]
 enabled = true
