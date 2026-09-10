@@ -59,7 +59,8 @@ end
 
 Applies the initial-baseline policy: one largest all-standard-protein chain,
 adequate observed N/CA/C/O backbone coverage, and a token count below the
-model's padded-atom budget. `nothing` means the file is deliberately excluded.
+model's padded-atom budget. Set `max_atoms=0` to retain oversized chains for
+a crop-aware training pipeline. `nothing` means the file is deliberately excluded.
 """
 function inspect_candidate(path::AbstractString; max_atoms::Int=1200, min_residues::Int=40,
     min_backbone_coverage::Real=0.95, skip_nmr::Bool=true)
@@ -75,7 +76,9 @@ function inspect_candidate(path::AbstractString; max_atoms::Int=1200, min_residu
     coverage >= min_backbone_coverage || return nothing
 
     tokens = tokenize_structure(selected)
-    length(tokens) <= max_atoms || return nothing
+    # `max_atoms=0` is the rich-corpus mode: retain complete large chains and
+    # let the training loader draw bounded residue-complete crops later.
+    (max_atoms == 0 || length(tokens) <= max_atoms) || return nothing
     sequence = join(AA1[r.res_name] for r in selected)
     CuratedCandidate(abspath(path), splitext(basename(path))[1], first(selected).chain_id,
         n_residues, length(tokens), coverage, sequence)
@@ -182,6 +185,7 @@ function curate(input_dir::AbstractString, output_dir::AbstractString; n_structu
     abspath(input_dir) == abspath(output_dir) && throw(ArgumentError("input and output directories must differ"))
     isdir(output_dir) && !isempty(readdir(output_dir)) && throw(ArgumentError("output directory must be empty: $output_dir"))
     n_structures > 0 || throw(ArgumentError("n_structures must be positive"))
+    max_atoms >= 0 || throw(ArgumentError("max_atoms must be nonnegative; use 0 for no atom cap"))
     0 < min_backbone_coverage <= 1 || throw(ArgumentError("min_backbone_coverage must lie in (0, 1]"))
     mkpath(output_dir)
 

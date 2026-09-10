@@ -6,6 +6,10 @@
 [data]
 data_dir = "CHANGE_ME_TO_A_LOCAL_PDB_DIRECTORY"
 max_atoms = 1200
+# `skip` keeps only complete chains within the budget. `crop` retains larger
+# chains and draws residue-complete sequence/spatial crops at training time.
+oversize_policy = "skip"
+crop_strategy = "mixed" # sequence, spatial, or mixed
 # Defaults to `RUN_DIR/corpus_cache.jls`. Set an absolute path shared by runs
 # to reuse parsed/tokenized structures across hyperparameter experiments.
 # cache_path = "/scratch/diffusebiomol/corpus-max1200.jls"

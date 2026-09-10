@@ -17,6 +17,26 @@ include(joinpath(@__DIR__, "..", "scripts", "train_baseline.jl"))
         @test length(examples) == 3
         @test isempty(skipped)
         @test isfile(cache_path)
+        source = first(examples)
+        cap = maximum(length, residue_groups(source))
+        sequence_crop = crop_example(source, cap, "sequence", MersenneTwister(3); crop_id=1)
+        spatial_crop = crop_example(source, cap, "spatial", MersenneTwister(3); crop_id=1)
+        @test n_atoms(sequence_crop) <= cap
+        @test n_atoms(spatial_crop) <= cap
+        @test sequence_crop.source == source.source
+        @test spatial_crop.source == source.source
+        @test all(length(group) <= cap for group in residue_groups(sequence_crop))
+        epoch_a = materialize_crops([source], cap, "mixed", 7, 1)
+        epoch_b = materialize_crops([source], cap, "mixed", 7, 2)
+        @test only(epoch_a).source == source.source
+        @test only(epoch_b).source == source.source
+        @test only(epoch_a).label != only(epoch_b).label
+        crop_sources, _ = load_corpus(data_dir; max_atoms=cap, oversize_policy="crop", progress_every=1)
+        @test length(crop_sources) == 3
+        crop_train, crop_val = split_examples(crop_sources, 7, 0.34)
+        crop_train_examples = materialize_crops(crop_train, cap, "mixed", 7, 1)
+        crop_val_examples = materialize_crops(crop_val, cap, "mixed", 7, 0)
+        @test isempty(intersect(Set(ex.source for ex in crop_train_examples), Set(ex.source for ex in crop_val_examples)))
         limited_examples, _ = load_corpus(data_dir; max_atoms=100, max_candidate_files=2, selection_seed=7,
             progress_every=1)
         @test length(limited_examples) == 2

@@ -6,6 +6,10 @@
 [data]
 data_dir = "CHANGE_ME_TO_A_LOCAL_10K_PDB_DIRECTORY"
 max_atoms = 1200
+# Retain large source chains and train/evaluate on fixed or epoch-varying
+# residue-complete crops within this budget.
+oversize_policy = "crop"
+crop_strategy = "mixed"
 # Defaults to `RUN_DIR/corpus_cache.jls`; use shared storage to reuse this
 # one-time CPU preprocessing cost across restarted or follow-on experiments.
 # cache_path = "/scratch/diffusebiomol/pdb10k-max1200.jls"

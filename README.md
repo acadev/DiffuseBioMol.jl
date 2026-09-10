@@ -273,6 +273,28 @@ The first build remains CPU-bound because every mmCIF must be parsed once;
 schedule it before occupying an H100 allocation when possible. Later training
 and resumed runs incur only cache deserialization.
 
+### Rich-corpus crop training
+
+For a crop-aware run, curate with `--max-atoms=0` to retain complete large
+protein chains, then use `oversize_policy = "crop"` and a positive
+`max_atoms` training budget. The trainer splits sources before cropping, draws
+one new residue-complete crop per oversized training source per epoch, and
+uses fixed held-out crops for comparable validation. `crop_strategy = "mixed"`
+alternates contiguous sequence windows and spatial residue neighborhoods;
+individual atoms are never sampled independently.
+
+```sh
+JULIA_NUM_THREADS=16 julia --project=. scripts/curate_protein_dataset.jl \
+  /data/pdb-raw /data/pdb-rich \
+  --n-structures=50000 --max-atoms=0 --min-residues=40 --seed=20260909 \
+  --concurrency=16
+```
+
+This improves local-geometry coverage, but it does not turn crops into new
+experimental conformations or enable stitched full-protein generation. Keep
+all crops from a source in one split (the runner does this), and use a
+sequence-clustered holdout when comparing against externally clustered data.
+
 Build the cache without initializing CUDA, W&B, or training:
 
 ```sh

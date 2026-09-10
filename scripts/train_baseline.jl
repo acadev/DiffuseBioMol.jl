@@ -44,7 +44,7 @@ using TOML, Serialization, Statistics, Printf, Dates
 import Wandb
 
 const Lux = DiffuseBioMol.Model.Network.Lux
-const CORPUS_CACHE_VERSION = 2
+const CORPUS_CACHE_VERSION = 3
 
 """One loaded structure plus all immutable metadata needed by training/eval."""
 struct BaselineExample
@@ -81,18 +81,94 @@ function load_config(path::AbstractString)
     (data=data, model=model, training=training, evaluation=evaluation, raw=config, path=abspath(path))
 end
 
+function make_example(label::AbstractString, source::AbstractString, tokens::Vector{AtomToken})
+    isempty(tokens) && error("no tokens after selecting/cropping structure")
+    feat = featurize(tokens)
+    BaselineExample(
+        String(label), abspath(source), tokens, feat, relpos_buckets(feat),
+        target_coordinates(tokens), constraint_features(no_constraints(length(tokens))),
+        backbone_bonds(tokens), chiral_centers(tokens), [t.element for t in tokens],
+    )
+end
+
 function load_example(path::AbstractString)
     residues = parse_structure(path)
     isempty(residues) && error("no residues parsed")
     chain = largest_chain(residues)
     tokens = tokenize_structure(restrict_to_chain(residues, chain))
-    isempty(tokens) && error("no tokens after selecting largest chain")
-    feat = featurize(tokens)
-    BaselineExample(
-        splitext(basename(path))[1], abspath(path), tokens, feat, relpos_buckets(feat),
-        target_coordinates(tokens), constraint_features(no_constraints(length(tokens))),
-        backbone_bonds(tokens), chiral_centers(tokens), [t.element for t in tokens],
-    )
+    make_example(splitext(basename(path))[1], path, tokens)
+end
+
+"""Token-index groups, one complete residue per group, in source order."""
+function residue_groups(ex::BaselineExample)
+    groups = Vector{Vector{Int}}()
+    previous = nothing
+    for (i, token) in enumerate(ex.tokens)
+        key = (token.chain_id, token.res_index)
+        if previous != key
+            push!(groups, Int[])
+            previous = key
+        end
+        push!(groups[end], i)
+    end
+    groups
+end
+
+function residue_center(ex::BaselineExample, group)
+    observed = [i for i in group if !ex.tokens[i].is_virtual]
+    isempty(observed) && return zeros(Float64, 3)
+    vec(sum(ex.x1[:, observed]; dims=2) ./ length(observed))
+end
+
+function sequence_crop_indices(ex::BaselineExample, groups, max_atoms::Int, rng::AbstractRNG)
+    valid_starts = findall(group -> length(group) <= max_atoms, groups)
+    isempty(valid_starts) && error("no residue fits within crop_max_atoms=$max_atoms")
+    start = rand(rng, valid_starts)
+    selected = Int[]
+    used = 0
+    for group in groups[start:end]
+        used + length(group) <= max_atoms || break
+        append!(selected, group)
+        used += length(group)
+    end
+    selected
+end
+
+function spatial_crop_indices(ex::BaselineExample, groups, max_atoms::Int, rng::AbstractRNG)
+    centers = [residue_center(ex, group) for group in groups]
+    valid_anchors = findall(group -> length(group) <= max_atoms, groups)
+    isempty(valid_anchors) && error("no residue fits within crop_max_atoms=$max_atoms")
+    anchor = rand(rng, valid_anchors)
+    ranked = sortperm(1:length(groups); by=i -> (sum(abs2, centers[i] .- centers[anchor]), i))
+    selected = Int[]
+    used = 0
+    for i in ranked
+        used + length(groups[i]) <= max_atoms || continue
+        append!(selected, groups[i])
+        used += length(groups[i])
+    end
+    sort!(selected)
+end
+
+"""Draw a residue-complete bounded crop; source and residue identifiers are preserved."""
+function crop_example(ex::BaselineExample, max_atoms::Int, strategy::AbstractString, rng::AbstractRNG; crop_id::Int=0)
+    n_atoms(ex) <= max_atoms && return ex
+    groups = residue_groups(ex)
+    selected_strategy = strategy == "mixed" ? (rand(rng, Bool) ? "sequence" : "spatial") : String(strategy)
+    indices = if selected_strategy == "sequence"
+        sequence_crop_indices(ex, groups, max_atoms, rng)
+    elseif selected_strategy == "spatial"
+        spatial_crop_indices(ex, groups, max_atoms, rng)
+    else
+        throw(ArgumentError("crop_strategy must be sequence, spatial, or mixed; got $strategy"))
+    end
+    make_example("$(ex.label)#$(selected_strategy)-$(crop_id)", ex.source, ex.tokens[indices])
+end
+
+"""One deterministic, epoch-varying crop per source; all crops retain their original source path."""
+function materialize_crops(sources::Vector{BaselineExample}, max_atoms::Int, strategy::AbstractString, seed::Int, epoch::Int)
+    rng = MersenneTwister(seed + 1_000_003 * epoch)
+    [crop_example(ex, max_atoms, strategy, rng; crop_id=epoch) for ex in sources]
 end
 
 """A cheap, deterministic fingerprint for invalidating a preprocessed corpus cache."""
@@ -101,12 +177,13 @@ function corpus_signature(files)
 end
 
 function load_cached_corpus(cache_path::AbstractString, signature, max_atoms::Int,
-                            max_candidate_files::Int, selection_seed::Int)
+                            max_candidate_files::Int, selection_seed::Int, oversize_policy::AbstractString)
     isfile(cache_path) || return nothing
     try
         cached = deserialize(cache_path)
         if cached.version == CORPUS_CACHE_VERSION && cached.max_atoms == max_atoms &&
            cached.max_candidate_files == max_candidate_files && cached.selection_seed == selection_seed &&
+           cached.oversize_policy == oversize_policy &&
            cached.signature == signature
             println("Corpus cache: loaded $(length(cached.examples)) usable structures from $cache_path.")
             return cached.examples, cached.skipped
@@ -119,14 +196,14 @@ function load_cached_corpus(cache_path::AbstractString, signature, max_atoms::In
 end
 
 function write_corpus_cache(cache_path::AbstractString, signature, max_atoms::Int,
-                            max_candidate_files::Int, selection_seed::Int, examples, skipped)
+                            max_candidate_files::Int, selection_seed::Int, oversize_policy::AbstractString, examples, skipped)
     parent = dirname(cache_path)
     isempty(parent) || mkpath(parent)
     temporary = cache_path * ".tmp.$(getpid()).$(rand(UInt))"
     try
         serialize(temporary, (version=CORPUS_CACHE_VERSION, signature=signature,
             max_atoms=max_atoms, max_candidate_files=max_candidate_files,
-            selection_seed=selection_seed, examples=examples, skipped=skipped))
+            selection_seed=selection_seed, oversize_policy=String(oversize_policy), examples=examples, skipped=skipped))
         mv(temporary, cache_path; force=true)
     finally
         isfile(temporary) && rm(temporary; force=true)
@@ -136,11 +213,13 @@ end
 
 """Load a fixed corpus with observable progress and optional persistent preprocessing cache."""
 function load_corpus(data_dir::AbstractString; max_atoms::Int, cache_path::Union{Nothing,AbstractString}=nothing,
-                     progress_every::Int=25, max_candidate_files::Int=0, selection_seed::Int=0)
+                     progress_every::Int=25, max_candidate_files::Int=0, selection_seed::Int=0,
+                     oversize_policy::AbstractString="skip")
     files = list_structure_files(data_dir; recursive=true)
     isempty(files) && throw(ArgumentError("no PDB/mmCIF files found under $data_dir"))
     progress_every > 0 || throw(ArgumentError("progress_every must be positive"))
     max_candidate_files >= 0 || throw(ArgumentError("max_candidate_files must be nonnegative"))
+    oversize_policy in ("skip", "crop") || throw(ArgumentError("oversize_policy must be skip or crop"))
     if max_candidate_files > 0 && length(files) > max_candidate_files
         selection = randperm(MersenneTwister(selection_seed), length(files))[1:max_candidate_files]
         files = sort(files[selection])
@@ -148,7 +227,7 @@ function load_corpus(data_dir::AbstractString; max_atoms::Int, cache_path::Union
     end
     signature = corpus_signature(files)
     if cache_path !== nothing
-        cached = load_cached_corpus(cache_path, signature, max_atoms, max_candidate_files, selection_seed)
+        cached = load_cached_corpus(cache_path, signature, max_atoms, max_candidate_files, selection_seed, oversize_policy)
         cached === nothing || return cached
     end
 
@@ -161,7 +240,7 @@ function load_corpus(data_dir::AbstractString; max_atoms::Int, cache_path::Union
         end
         try
             ex = load_example(path)
-            if n_atoms(ex) <= max_atoms
+            if n_atoms(ex) <= max_atoms || oversize_policy == "crop"
                 push!(examples, ex)
             else
                 push!(skipped, "$path ($(n_atoms(ex)) atoms > max_atoms=$max_atoms)")
@@ -172,7 +251,7 @@ function load_corpus(data_dir::AbstractString; max_atoms::Int, cache_path::Union
     end
     isempty(examples) && error("no usable structures in $data_dir")
     cache_path === nothing || write_corpus_cache(cache_path, signature, max_atoms,
-        max_candidate_files, selection_seed, examples, skipped)
+        max_candidate_files, selection_seed, oversize_policy, examples, skipped)
     examples, skipped
 end
 
@@ -394,10 +473,14 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
     rng = MersenneTwister(seed)
     configured_cache = String(get(data, "cache_path", joinpath(run_dir, "corpus_cache.jls")))
     cache_path = isempty(configured_cache) ? nothing : abspath(configured_cache)
+    oversize_policy = String(get(data, "oversize_policy", "skip"))
+    crop_strategy = String(get(data, "crop_strategy", "mixed"))
+    crop_strategy in ("sequence", "spatial", "mixed") || error("data.crop_strategy must be sequence, spatial, or mixed")
+    Int(require_key(data, "max_atoms")) > 0 || error("data.max_atoms must be positive for baseline training")
     examples, skipped = load_corpus(String(require_key(data, "data_dir"));
         max_atoms=Int(require_key(data, "max_atoms")), cache_path,
         progress_every=Int(get(data, "load_progress_every", 25)),
-        max_candidate_files=Int(get(data, "max_candidate_files", 0)), selection_seed=seed)
+        max_candidate_files=Int(get(data, "max_candidate_files", 0)), selection_seed=seed, oversize_policy)
     max_structures = Int(get(data, "max_structures", 0))
     if max_structures > 0 && length(examples) > max_structures
         examples = sort(examples; by = ex -> ex.source)[randperm(MersenneTwister(seed), length(examples))[1:max_structures]]
@@ -405,7 +488,10 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
     min_structures = Int(get(data, "min_structures", 3))
     length(examples) >= min_structures || error("only $(length(examples)) usable structures; data.min_structures requires $min_structures")
     training, validation = split_examples(examples, seed, Float64(require_key(data, "validation_fraction")))
-    sentinel = validation_sentinel(validation, Int(get(eval_cfg, "sentinel_size", length(validation))), seed + 1)
+    # Crops are drawn only after the source-level split, so no source chain can
+    # leak a different crop into train and validation.
+    validation_crops = materialize_crops(validation, Int(require_key(data, "max_atoms")), crop_strategy, seed, 0)
+    sentinel = validation_sentinel(validation_crops, Int(get(eval_cfg, "sentinel_size", length(validation_crops))), seed + 1)
     write_manifest(joinpath(run_dir, "manifest.toml"), config, training, validation, skipped; sentinel)
     println("Loaded $(length(examples)) usable structures: $(length(training)) train, $(length(validation)) validation; $(length(skipped)) skipped.")
     if prepare_only
@@ -443,7 +529,7 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
         start_epoch = 1
         # A full untrained validation pass is done exactly once so the final
         # reconstruction gate compares against the actual initialization.
-        initial_reports = evaluate(model, host_device(ps), host_device(st), validation, seed, Int(require_key(eval_cfg, "sample_steps")))
+        initial_reports = evaluate(model, host_device(ps), host_device(st), validation_crops, seed, Int(require_key(eval_cfg, "sample_steps")))
         append_metrics(joinpath(run_dir, "metrics.csv"), 0, NaN, "full_initial", initial_reports)
         log_wandb_epoch!(tracker, 0, NaN, "full_initial", initial_reports)
     end
@@ -454,7 +540,8 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
     final_reports = initial_reports
     for epoch in start_epoch:epochs
         losses = Float64[]
-        for batch in length_bucket_batches(training, Int(require_key(training_cfg, "batch_size")), rng)
+        epoch_crops = materialize_crops(training, Int(require_key(data, "max_atoms")), crop_strategy, seed, epoch)
+        for batch in length_bucket_batches(epoch_crops, Int(require_key(training_cfg, "batch_size")), rng)
             ps, opt_state, loss = train_batch(model, ps, st, opt_state, batch, rng, device)
             push!(losses, loss)
         end
@@ -462,7 +549,7 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
         println("epoch $epoch/$epochs: train CFM loss = $(@sprintf("%.6f", train_loss))")
         if epoch % checkpoint_every == 0 || epoch == epochs
             full = epoch % full_validation_every == 0 || epoch == epochs
-            eval_examples, scope = full ? (validation, "full") : (sentinel, "sentinel")
+            eval_examples, scope = full ? (validation_crops, "full") : (sentinel, "sentinel")
             final_reports = evaluate(model, host_device(ps), host_device(st), eval_examples, seed, Int(require_key(eval_cfg, "sample_steps")))
             append_metrics(joinpath(run_dir, "metrics.csv"), epoch, train_loss, scope, final_reports)
             log_wandb_epoch!(tracker, epoch, train_loss, scope, final_reports)

@@ -15,6 +15,8 @@ using .CurateProteinDataset
         @test candidate.chain_id == "A"
         @test candidate.n_residues == 2
         @test candidate.backbone_coverage == 1.0
+        @test inspect_candidate(joinpath(input_dir, "candidate_1.pdb"); max_atoms=1, min_residues=1) === nothing
+        @test inspect_candidate(joinpath(input_dir, "candidate_1.pdb"); max_atoms=0, min_residues=1) !== nothing
 
         selected = curate(input_dir, output_dir; n_structures=2, seed=1, max_atoms=100, min_residues=1, concurrency=2)
         @test length(selected) == 2
