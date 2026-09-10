@@ -326,9 +326,15 @@ sample of experimental protein entries in mmCIF form. The script saves its exact
 selection and resumes from valid cached files on the next invocation:
 
 ```sh
-julia --project=. scripts/download_rcsb_dataset.jl /data/rcsb-raw \
-  --n-structures=15000 --seed=20260909 --retries=3
+JULIA_NUM_THREADS=8 julia --project=. scripts/download_rcsb_dataset.jl /data/rcsb-raw \
+  --n-structures=15000 --seed=20260909 --retries=3 --concurrency=8
 ```
+
+`--concurrency` bounds simultaneous HTTP downloads while retaining a
+deterministic sampled-ID list and manifest. Start with 8 workers (rather than
+an unbounded fan-out), and set `JULIA_NUM_THREADS` to at least that value so
+the workers have parallel execution capacity. Rerun the same command after interruption: valid
+cached mmCIF files are skipped and only missing/failed IDs are retried.
 
 Then use `/data/rcsb-raw` as the input to `curate_protein_dataset.jl`. Keep
 the generated `sampled_ids.txt` and `download_manifest.toml` with the run for

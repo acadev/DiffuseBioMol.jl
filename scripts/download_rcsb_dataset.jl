@@ -3,7 +3,7 @@ Download and cache a seeded random sample of experimental protein structures
 from RCSB PDB in mmCIF format.
 
 Usage:
-    julia --project=. scripts/download_rcsb_dataset.jl /data/rcsb-raw \
+    JULIA_NUM_THREADS=8 julia --project=. scripts/download_rcsb_dataset.jl /data/rcsb-raw \
         --n-structures=15000 --seed=20260909 --concurrency=4
 
 The first run queries RCSB's Search API for experimental entries containing at
@@ -128,10 +128,11 @@ function download_one(id::AbstractString, cache_dir::AbstractString; retries::In
     throw(last_error)
 end
 
-function write_download_manifest(path::AbstractString, ids, downloaded, cached, failures, seed)
+function write_download_manifest(path::AbstractString, ids, downloaded, cached, failures, seed, concurrency)
     doc = Dict(
         "created_at" => string(now()), "seed" => seed, "requested_ids" => ids,
         "downloaded" => downloaded, "cached" => cached, "failures" => failures,
+        "concurrency" => concurrency,
     )
     open(path, "w") do io
         TOML.print(io, doc)
@@ -140,17 +141,19 @@ end
 
 """
     download_dataset(cache_dir; n_structures=15000, seed=20260909,
-                     retries=3) -> NamedTuple
+                     retries=3, concurrency=1) -> NamedTuple
 
 Creates/reuses a persistent `sampled_ids.txt` selection. Downloads are
-sequential by design: it is polite to RCSB, avoids corrupting a shared cache,
-and still resumes cleanly after a job interruption. `concurrency` is accepted
-by the CLI only as a future compatibility option and must be one for now.
+performed by a bounded number of worker tasks. Each complete result is
+collected before the manifest is written; manifest lists retain the sampled-ID
+order rather than nondeterministic completion order. A rerun skips valid files
+and retries only missing/failed IDs, including after an interruption.
 """
 function download_dataset(cache_dir::AbstractString; n_structures::Int=15_000,
-    seed::Int=20_260_909, retries::Int=3)
+    seed::Int=20_260_909, retries::Int=3, concurrency::Int=1, download_fn=download_one)
     n_structures > 0 || throw(ArgumentError("n_structures must be positive"))
     retries > 0 || throw(ArgumentError("retries must be positive"))
+    concurrency > 0 || throw(ArgumentError("concurrency must be positive"))
     mkpath(cache_dir)
     sampled_path = joinpath(cache_dir, "sampled_ids.txt")
     ids = if isfile(sampled_path)
@@ -163,19 +166,44 @@ function download_dataset(cache_dir::AbstractString; n_structures::Int=15_000,
         selection
     end
 
-    downloaded, cached, failures = String[], String[], Dict{String,String}()
-    for (i, id) in enumerate(ids)
-        try
-            status = download_one(id, cache_dir; retries)
-            push!(status == :cached ? cached : downloaded, id)
-        catch err
-            failures[id] = sprint(showerror, err)
-        end
-        (i % 100 == 0 || i == length(ids)) && println("$i / $(length(ids)): $(length(downloaded)) downloaded, $(length(cached)) cached, $(length(failures)) failed")
+    n_workers = min(concurrency, length(ids))
+    println("Downloading $(length(ids)) structures with $n_workers concurrent worker$(n_workers == 1 ? "" : "s").")
+    jobs = Channel{Tuple{Int,String}}(length(ids))
+    results = Channel{Any}(length(ids))
+    for job in enumerate(ids)
+        put!(jobs, job)
     end
-    write_download_manifest(joinpath(cache_dir, "download_manifest.toml"), ids, downloaded, cached, failures, seed)
+    close(jobs)
+    workers = [Threads.@spawn begin
+        for (i, id) in jobs
+            try
+                put!(results, (i=i, id=id, status=download_fn(id, cache_dir; retries), failure=nothing))
+            catch err
+                put!(results, (i=i, id=id, status=:failed, failure=sprint(showerror, err)))
+            end
+        end
+    end for _ in 1:n_workers]
+
+    statuses = Vector{Symbol}(undef, length(ids))
+    errors = Vector{Union{Nothing,String}}(undef, length(ids))
+    completed = downloaded_count = cached_count = failed_count = 0
+    for _ in ids
+        result = take!(results)
+        statuses[result.i] = result.status
+        errors[result.i] = result.failure
+        completed += 1
+        result.status == :downloaded && (downloaded_count += 1)
+        result.status == :cached && (cached_count += 1)
+        result.status == :failed && (failed_count += 1)
+        (completed % 100 == 0 || completed == length(ids)) && println("$completed / $(length(ids)): $downloaded_count downloaded, $cached_count cached, $failed_count failed")
+    end
+    foreach(fetch, workers)
+    downloaded = [id for (id, status) in zip(ids, statuses) if status == :downloaded]
+    cached = [id for (id, status) in zip(ids, statuses) if status == :cached]
+    failures = Dict(id => something(errors[i], "unknown download failure") for (i, id) in enumerate(ids) if statuses[i] == :failed)
+    write_download_manifest(joinpath(cache_dir, "download_manifest.toml"), ids, downloaded, cached, failures, seed, concurrency)
     isempty(failures) || println("$(length(failures)) downloads failed; rerun the same command to retry them.")
-    (ids=ids, downloaded=downloaded, cached=cached, failures=failures)
+    (ids=ids, downloaded=downloaded, cached=cached, failures=failures, concurrency=n_workers)
 end
 
 function main(args=ARGS)
@@ -188,8 +216,7 @@ function main(args=ARGS)
         haskey(options, key) || error("unsupported option: --$key")
         options[key] = parse(Int, value)
     end
-    options["concurrency"] == 1 || error("concurrency > 1 is not implemented yet; use --concurrency=1")
-    download_dataset(cache_dir; n_structures=options["n-structures"], seed=options["seed"], retries=options["retries"])
+    download_dataset(cache_dir; n_structures=options["n-structures"], seed=options["seed"], retries=options["retries"], concurrency=options["concurrency"])
 end
 
 end # module RCSBDownloader
