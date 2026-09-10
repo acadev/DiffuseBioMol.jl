@@ -21,8 +21,8 @@ and the next epoch, so interruption does not change the training trajectory.
 
 Set `[wandb].enabled = true` in the TOML configuration to mirror run metadata,
 epoch losses, validation aggregates, and final gate status to a Weights & Biases
-dashboard. The client is loaded only in that opt-in path; set `WANDB_API_KEY`
-in the job environment rather than storing a credential here.
+dashboard. A W&B run is initialized only in that opt-in path; set
+`WANDB_API_KEY` in the job environment rather than storing a credential here.
 
 Geometry reporting is native to this package: clash count, backbone bond RMSD,
 and CA chirality violations. Reconstruction is aligned coordinate RMSD from a
@@ -34,6 +34,7 @@ investigate, never silently treated as a successful baseline.
 using DiffuseBioMol
 using Random, Zygote, Optimisers
 using TOML, Serialization, Statistics, Printf, Dates
+import Wandb
 
 const Lux = DiffuseBioMol.Model.Network.Lux
 
@@ -141,8 +142,6 @@ function start_wandb(config, run_dir::AbstractString, training, validation, sent
     wandb_cfg = get(config.raw, "wandb", Dict{String,Any}())
     Bool(get(wandb_cfg, "enabled", false)) || return nothing
     haskey(ENV, "WANDB_API_KEY") || error("[wandb].enabled=true requires WANDB_API_KEY in the job environment")
-    Base.find_package("Wandb") === nothing && error("Wandb.jl is not available; run `Pkg.add(\"Wandb\")` in this project")
-    @eval import Wandb
 
     name = String(get(wandb_cfg, "name", ""))
     isempty(name) && (name = basename(abspath(run_dir)))
