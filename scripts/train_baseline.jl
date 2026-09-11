@@ -47,6 +47,15 @@ import Wandb
 
 const Lux = DiffuseBioMol.Model.Network.Lux
 const CORPUS_CACHE_VERSION = 4
+const GPU_LAUNCH_REQUESTED = "--gpu" in ARGS && ! ("--prepare-only" in ARGS)
+
+# Load optional GPU triggers at top level. Importing an extension inside a
+# compiled function creates a too-new global binding under Julia 1.12.
+if GPU_LAUNCH_REQUESTED
+    Base.find_package("LuxCUDA") === nothing && error("--gpu requires LuxCUDA.jl in the active Julia environment; run `julia --project=. -e 'using Pkg; Pkg.add(\"LuxCUDA\")'`")
+    @eval import CUDA
+    @eval using LuxCUDA
+end
 
 """Lightweight cached source: tokens only, with no O(N²) pair features."""
 struct BaselineSource
@@ -562,10 +571,9 @@ end
 
 function selected_device(use_gpu::Bool)
     use_gpu || return identity
-    Base.find_package("LuxCUDA") === nothing && error("--gpu requires LuxCUDA.jl in the active Julia environment; run `julia --project=. -e 'using Pkg; Pkg.add(\"LuxCUDA\")'`")
     # LuxCUDA, rather than CUDA.jl alone, registers the CUDA device trigger
     # with MLDataDevices. Refuse CPU fallback when the caller requested --gpu.
-    @eval using LuxCUDA
+    GPU_LAUNCH_REQUESTED || error("--gpu device selection requires launching this script with the --gpu flag")
     CUDA.functional() || error("--gpu was requested, but CUDA.jl cannot use a functional GPU in this environment")
     println("Using CUDA device: $(CUDA.name(CUDA.device()))")
     Lux.gpu_device()
