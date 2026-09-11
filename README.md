@@ -253,8 +253,11 @@ julia --project=. scripts/train_baseline.jl configs/h100_10k.toml runs/h100-10k 
 ### Large-corpus loading
 
 The baseline runner parses and tokenizes each coordinate file once, then writes
-`corpus_cache.jls` under the run directory. A restart reuses it without
-re-parsing. For the same curated corpus across multiple experiments, set
+the lightweight source tokens and coordinates to `corpus_cache.v4.jls` under
+the run directory. A restart reuses it without re-parsing. Pairwise tensors,
+coordinates in model layout, and geometry metadata are built only after a
+bounded crop is selected; they are never serialized for an uncropped protein.
+For the same curated corpus across multiple experiments, set
 `data.cache_path` to one absolute path on shared scratch storage (for example,
 `/scratch/diffusebiomol/pdb10k-max1200.jls`). The cache is accepted only when
 the selected source paths, sizes, modification times, atom cap, and candidate
@@ -271,7 +274,11 @@ least 10,000 valid structures for that profile.
 
 The first build remains CPU-bound because every mmCIF must be parsed once;
 schedule it before occupying an H100 allocation when possible. Later training
-and resumed runs incur only cache deserialization.
+and resumed runs incur only lightweight cache deserialization. Cache format v4
+is required for crop-aware training and has its own filename. This deliberately
+leaves a legacy `corpus_cache.jls` untouched, so it is never opened or
+deserialized; remove that old file manually after you have verified the new
+cache.
 
 ### Rich-corpus crop training
 

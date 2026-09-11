@@ -10,9 +10,9 @@ max_atoms = 1200
 # chains and draws residue-complete sequence/spatial crops at training time.
 oversize_policy = "skip"
 crop_strategy = "mixed" # sequence, spatial, or mixed
-# Defaults to `RUN_DIR/corpus_cache.jls`. Set an absolute path shared by runs
+# Defaults to `RUN_DIR/corpus_cache.v4.jls`. Set an absolute path shared by runs
 # to reuse parsed/tokenized structures across hyperparameter experiments.
-# cache_path = "/scratch/diffusebiomol/corpus-max1200.jls"
+# cache_path = "/scratch/diffusebiomol/corpus-max1200.jls" # stored as `.v4.jls`
 load_progress_every = 25
 # 0 parses every source file. Set a bound before pointing at a large raw mirror.
 max_candidate_files = 0

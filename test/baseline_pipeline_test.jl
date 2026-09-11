@@ -17,6 +17,10 @@ include(joinpath(@__DIR__, "..", "scripts", "train_baseline.jl"))
         @test length(examples) == 3
         @test isempty(skipped)
         @test isfile(cache_path)
+        cached_payload = deserialize(cache_path)
+        @test hasproperty(cached_payload, :sources)
+        @test !hasproperty(first(cached_payload.sources), :feat)
+        @test !hasproperty(first(cached_payload.sources), :relpos)
         source = first(examples)
         cap = maximum(length, residue_groups(source))
         sequence_crop = crop_example(source, cap, "sequence", MersenneTwister(3); crop_id=1)
@@ -31,13 +35,14 @@ include(joinpath(@__DIR__, "..", "scripts", "train_baseline.jl"))
         @test only(epoch_a).source == source.source
         @test only(epoch_b).source == source.source
         @test only(epoch_a).label != only(epoch_b).label
-        fixed = infill_fixed_mask(source, 0.5, MersenneTwister(9))
+        full_example = only(materialize_crops([source], 100, "mixed", 7, 0))
+        fixed = infill_fixed_mask(full_example, 0.5, MersenneTwister(9))
         @test any(fixed)
-        @test any(.!fixed .& .!source.feat.is_virtual)
-        infill_cond, infill_fixed, fixed_coord = infill_conditioning(source, 0.5, MersenneTwister(9))
+        @test any(.!fixed .& .!full_example.feat.is_virtual)
+        infill_cond, infill_fixed, fixed_coord = infill_conditioning(full_example, 0.5, MersenneTwister(9))
         @test infill_fixed == fixed
         @test all(infill_cond[1, :] .== Float32.(fixed))
-        @test fixed_coord == Float32.(source.x1)
+        @test fixed_coord == Float32.(full_example.x1)
         crop_sources, _ = load_corpus(data_dir; max_atoms=cap, oversize_policy="crop", progress_every=1)
         @test length(crop_sources) == 3
         crop_train, crop_val = split_examples(crop_sources, 7, 0.34)
@@ -71,7 +76,9 @@ include(joinpath(@__DIR__, "..", "scripts", "train_baseline.jl"))
         prepare_dir = joinpath(dir, "prepared-run")
         prepared = main(prepare_config, prepare_dir; prepare_only=true)
         @test length(prepared.training) == 2
-        @test isfile(joinpath(prepare_dir, "corpus_cache.jls"))
+        @test isfile(joinpath(prepare_dir, "corpus_cache.v4.jls"))
+        @test versioned_cache_path(joinpath(prepare_dir, "corpus_cache.jls")) ==
+            joinpath(prepare_dir, "corpus_cache.v4.jls")
         train_a, val_a = split_examples(examples, 7, 0.34)
         train_b, val_b = split_examples(examples, 7, 0.34)
         @test [ex.source for ex in train_a] == [ex.source for ex in train_b]

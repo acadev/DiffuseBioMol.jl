@@ -10,9 +10,9 @@ max_atoms = 1200
 # residue-complete crops within this budget.
 oversize_policy = "crop"
 crop_strategy = "mixed"
-# Defaults to `RUN_DIR/corpus_cache.jls`; use shared storage to reuse this
+# Defaults to `RUN_DIR/corpus_cache.v4.jls`; use shared storage to reuse this
 # one-time CPU preprocessing cost across restarted or follow-on experiments.
-# cache_path = "/scratch/diffusebiomol/pdb10k-max1200.jls"
+# cache_path = "/scratch/diffusebiomol/pdb10k-max1200.jls" # stored as `.v4.jls`
 load_progress_every = 25
 # Parse at most this many deterministic candidates before retaining 10,000.
 # Keep this above 10,000 to allow for malformed or over-budget structures.
