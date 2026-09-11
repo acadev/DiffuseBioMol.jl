@@ -35,6 +35,10 @@ include(joinpath(@__DIR__, "..", "scripts", "train_baseline.jl"))
         @test only(epoch_a).source == source.source
         @test only(epoch_b).source == source.source
         @test only(epoch_a).label != only(epoch_b).label
+        source_batches = length_bucket_batches(examples, 2, MersenneTwister(11))
+        @test sum(length, source_batches) == length(examples)
+        lazy_batch = materialize_crop_batch(first(source_batches), 100, "mixed", 7, 1, 1)
+        @test all(ex -> n_atoms(ex) <= 100, lazy_batch)
         full_example = only(materialize_crops([source], 100, "mixed", 7, 0))
         fixed = infill_fixed_mask(full_example, 0.5, MersenneTwister(9))
         @test any(fixed)

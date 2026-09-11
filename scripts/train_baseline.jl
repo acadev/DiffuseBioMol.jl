@@ -185,6 +185,13 @@ function materialize_crops(sources::Vector{BaselineSource}, max_atoms::Int, stra
     [crop_example(ex, max_atoms, strategy, rng; crop_id=epoch) for ex in sources]
 end
 
+"""Materialize one source batch without retaining pair features for an entire epoch."""
+function materialize_crop_batch(sources::Vector{BaselineSource}, max_atoms::Int, strategy::AbstractString,
+                                seed::Int, epoch::Int, batch_number::Int)
+    rng = MersenneTwister(seed + 1_000_003 * epoch + 7_919 * batch_number)
+    [crop_example(ex, max_atoms, strategy, rng; crop_id=epoch) for ex in sources]
+end
+
 """A cheap, deterministic fingerprint for invalidating a preprocessed corpus cache."""
 function corpus_signature(files)
     [(path=abspath(path), size=filesize(path), mtime=stat(path).mtime) for path in files]
@@ -652,8 +659,19 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
     println("Starting training at epoch $start_epoch; GPU work begins with the first batch.")
     for epoch in start_epoch:epochs
         losses = Float64[]
-        epoch_crops = materialize_crops(training, max_atoms, crop_strategy, seed, epoch)
-        for batch in length_bucket_batches(epoch_crops, Int(require_key(training_cfg, "batch_size")), rng)
+        source_batches = length_bucket_batches(training, Int(require_key(training_cfg, "batch_size")), rng)
+        println("epoch $epoch/$epochs: training $(length(source_batches)) crop batches lazily.")
+        batch_progress_every = max(1, cld(length(source_batches), 10))
+        for (batch_number, source_batch) in enumerate(source_batches)
+            # Creating all crops up front would retain an O(N²) pair matrix for
+            # every training source and can delay the first GPU batch for many
+            # minutes. Keep only one materialized batch alive at a time.
+            batch = materialize_crop_batch(source_batch, max_atoms, crop_strategy, seed, epoch, batch_number)
+            if batch_number == 1
+                println("epoch $epoch/$epochs: first crop batch ready; compiling/launching GPU training.")
+            elseif batch_number % batch_progress_every == 0 || batch_number == length(source_batches)
+                println("epoch $epoch/$epochs: batch $batch_number/$(length(source_batches)).")
+            end
             ps, opt_state, loss = train_batch(model, ps, st, opt_state, batch, rng, device;
                 infill_probability=Float64(get(training_cfg, "infill_probability", 0.0)), infill_fixed_fraction)
             push!(losses, loss)
