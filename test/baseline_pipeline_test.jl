@@ -96,6 +96,7 @@ include(joinpath(@__DIR__, "..", "scripts", "train_baseline.jl"))
             (condition="model", label="x", n_atoms=9, rmsd=8.0, clashes=7.0, bond_rmsd=2.0, chirality_bad=1.0),
         ]
         final = [
+            (condition="prior", label="x", n_atoms=9, rmsd=10.0, clashes=9.0, bond_rmsd=3.0, chirality_bad=2.0),
             (condition="model", label="x", n_atoms=9, rmsd=6.0, clashes=5.0, bond_rmsd=1.0, chirality_bad=0.0),
             (condition="model_guided", label="x", n_atoms=9, rmsd=6.0, clashes=4.0, bond_rmsd=0.8, chirality_bad=0.0),
         ]
