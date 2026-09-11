@@ -83,6 +83,8 @@ include(joinpath(@__DIR__, "..", "scripts", "train_baseline.jl"))
         @test isfile(joinpath(prepare_dir, "corpus_cache.v4.jls"))
         @test versioned_cache_path(joinpath(prepare_dir, "corpus_cache.jls")) ==
             joinpath(prepare_dir, "corpus_cache.v4.jls")
+        @test versioned_cache_path(joinpath(prepare_dir, "corpus_cache.v4.jls")) ==
+            joinpath(prepare_dir, "corpus_cache.v4.jls")
         train_a, val_a = split_examples(examples, 7, 0.34)
         train_b, val_b = split_examples(examples, 7, 0.34)
         @test [ex.source for ex in train_a] == [ex.source for ex in train_b]

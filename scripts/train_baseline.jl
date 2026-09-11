@@ -562,18 +562,20 @@ end
 
 function selected_device(use_gpu::Bool)
     use_gpu || return identity
-    Base.find_package("CUDA") === nothing && error("--gpu requires CUDA.jl in the active Julia environment")
-    # CUDA remains an optional trigger dependency; importing it here makes
-    # Lux.gpu_device() select the first visible CUDA device without adding it
-    # to DiffuseBioMol's package dependencies.
-    @eval using CUDA
+    Base.find_package("LuxCUDA") === nothing && error("--gpu requires LuxCUDA.jl in the active Julia environment; run `julia --project=. -e 'using Pkg; Pkg.add(\"LuxCUDA\")'`")
+    # LuxCUDA, rather than CUDA.jl alone, registers the CUDA device trigger
+    # with MLDataDevices. Refuse CPU fallback when the caller requested --gpu.
+    @eval using LuxCUDA
+    CUDA.functional() || error("--gpu was requested, but CUDA.jl cannot use a functional GPU in this environment")
+    println("Using CUDA device: $(CUDA.name(CUDA.device()))")
     Lux.gpu_device()
 end
 
 """Use a format-specific filename so an incompatible cache is never deserialized."""
 function versioned_cache_path(path::AbstractString)
     base, extension = splitext(abspath(path))
-    "$(base).v$(CORPUS_CACHE_VERSION)$(extension)"
+    suffix = ".v$(CORPUS_CACHE_VERSION)"
+    endswith(base, suffix) ? abspath(path) : "$(base)$(suffix)$(extension)"
 end
 
 function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool=false, prepare_only::Bool=false, device=identity)

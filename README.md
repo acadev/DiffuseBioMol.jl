@@ -245,8 +245,8 @@ julia --project=. scripts/train_baseline.jl configs/baseline.toml runs/baseline 
 # Optional, with CUDA.jl installed in the active Julia environment:
 julia --project=. scripts/train_baseline.jl configs/baseline.toml runs/baseline --gpu
 
-# H100 10k-structure profile (requires CUDA.jl in this project's environment):
-julia --project=. -e 'using Pkg; Pkg.add("CUDA")'
+# H100 10k-structure profile (requires LuxCUDA.jl, which registers Lux's CUDA device):
+julia --project=. -e 'using Pkg; Pkg.add("LuxCUDA")'
 # Copy configs/h100_10k.toml, set data.data_dir, then launch:
 julia --project=. scripts/train_baseline.jl configs/h100_10k.toml runs/h100-10k --gpu
 
