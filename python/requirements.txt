@@ -1,2 +1,3 @@
-# Run from the repository root; dependency pins live in pyproject.toml.
--e .
+torch==2.14.0
+numpy==2.5.3
+atomworks==3.0.0

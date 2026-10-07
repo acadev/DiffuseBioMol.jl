@@ -4,30 +4,31 @@ This is the primary development implementation: a Pairformer-lite/DiT flow-match
 with CPU/CUDA/MPS device selection, residue-complete sequence crops, polymer
 prior, centering/rotation augmentation, source-disjoint validation, checkpoint
 resume and per-batch timings. CPU has been exercised on real structures.
-See the [native baseline results](../docs/BASELINE.md).
+See the [measured results](../docs/PYTHON_BASELINE_20260918.md), including the
+Julia/PyTorch forward and gradient comparison.
 
 Run commands from the repository root. Python 3.12 was used for validation.
 
 ```sh
 python3.12 -m venv python/.venv
-python/.venv/bin/python -m pip install -e .
+python/.venv/bin/python -m pip install -r python/requirements.txt
 
 # Native AtomWorks parsing/tokenization; choose a NEW corpus directory.
-python/.venv/bin/python -m diffusebiomol.prepare_corpus \
+PYTHONPATH=python python/.venv/bin/python -m diffusebiomol.prepare_corpus \
   /path/to/structures runs/python-corpus
 
 # The trainer itself runs entirely in Python. Choose a NEW run directory.
-python/.venv/bin/python -m diffusebiomol.train \
+PYTHONPATH=python python/.venv/bin/python -m diffusebiomol.train \
   runs/python-corpus runs/python-experiment --epochs 10 --max-atoms 128 --batch-size 2
 
 # Resume with the same data, device, seed and hyperparameters; increase target epochs.
-python/.venv/bin/python -m diffusebiomol.train \
+PYTHONPATH=python python/.venv/bin/python -m diffusebiomol.train \
   runs/python-corpus runs/python-experiment --epochs 20 --max-atoms 128 --batch-size 2 --resume
 ```
 
 The input may be a local file or a recursively scanned directory of `.pdb`, `.ent`,
 `.cif`, `.mmcif`, or their `.gz` variants. Parsing, tokenization, and training are
-entirely Python. Preparation uses
+entirely Python; no Julia installation or export step is needed. Preparation uses
 [AtomWorks 3.0](https://rosettacommons.github.io/atomworks/latest/) with its minimal
 parser preset and Biotite's bundled CCD. No external CCD/PDB mirror is required.
 
@@ -43,7 +44,7 @@ single-atom metals/halides are classified as ions. This is a baseline component
 classification policy, not a comprehensive chemistry ontology.
 
 `diffusebiomol/vocabulary.json` freezes all 334 canonical atom IDs from the
-baseline vocabulary plus an unknown bucket. It is a checked-in data asset,
+existing baseline export plus an unknown bucket. It is a checked-in data asset,
 not generated at runtime. Parser chain IDs are recoded in encounter order;
 residue indices follow parser numbering, preserving gaps and separating insertion
 codes. AtomWorks may use mmCIF label numbering/chain IDs rather than author IDs.
@@ -85,17 +86,27 @@ checks may synchronize too. These are diagnostic baseline measurements, not a
 fully overlapped high-throughput trainer. First CUDA initialization, imports and
 environment startup are outside the per-epoch training timings.
 
-## Tests
+## Tests and historical numerical agreement
 
 ```sh
 # Parser/tokenizer, invariant and exact-resume tests using offline fixtures:
-python/.venv/bin/python -m unittest discover -s python/tests -v
+PYTHONPATH=python python/.venv/bin/python -m unittest discover -s python/tests -v
 
 # Repeat learning/resume/crop tests using a prepared real corpus:
-DBM_CORPUS=runs/python-corpus python/.venv/bin/python \
+DBM_CORPUS=runs/python-corpus PYTHONPATH=python python/.venv/bin/python \
   -m unittest discover -s python/tests -v
 
+# Optional historical Julia comparison (not part of the Python workflow):
+julia --project=. scripts/export_python_parity.jl runs/python-parity.json
+PYTHONPATH=python python/.venv/bin/python -m diffusebiomol.parity runs/python-parity.json
 ```
+
+The parity fixture uses a nonzero output head and nonzero conditioning so it
+exercises the encoder, decoder and backward path. It compares Float32 outputs,
+squared-output loss and coordinate/head weight gradients. This does not establish
+identical optimizer trajectories across frameworks: initialization, RNG sequences
+and low-level implementations differ. Padding/gradient invariance and masked CFM
+loss normalization are tested separately.
 
 The native AtomWorks path was validated on six local baseline structures on
 2026-10-07: all parsed successfully. Ten Python tests passed, including format
@@ -105,16 +116,22 @@ checkpoint resume on the newly prepared corpus. A fixed real crop's loss fell
 from 100.075775 to 0.053838 over 150 updates; this checks learning mechanics,
 not protein quality or held-out generalization.
 
+The parity exercise exposed a Julia LayerNorm axis bug: Lux's default normalized
+across tokens and batch members. `src/Model/Network.jl` now explicitly uses
+`dims=1`, and its padding regression test uses nonzero output weights. Earlier
+Julia checkpoints retain compatible tensor shapes but changed normalization
+semantics; restart the training baseline when comparing with this implementation.
+
 ## Scope
 
 Implemented: the existing linear-path **flow matching**, Euler sampler, dense
 pair-biased backbone and unconditional crop-training path. Categorical embeddings
 retain the frozen baseline vocabulary. The backbone accepts four conditioning
 features, but motif clamping, CFG, geometry guidance, verifier training and
-external verification are not implemented.
+external verification have not been ported to this runner.
 
 Diffusion remains an explicit future objective/schedule/sampler, not an alias for
-flow matching. There is no full-protein quality
+flow matching. No Julia code has been replaced. There is no full-protein quality
 claim, distributed trainer, mixed precision or asynchronous loader yet. The dense
 pair representation remains quadratic even when PyTorch uses fused attention.
 Neither increasing crop presentations nor stitching local outputs establishes
