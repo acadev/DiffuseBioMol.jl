@@ -131,7 +131,9 @@ end
 `Lux.LayerNorm` expects a 2D `(features, batch)` input; `s` here is
 `d x N x B` (features, sequence position, batch). Reshapes to `(d, N*B)`,
 applies `ln`, reshapes back — the same flatten-apply-restore pattern already
-used for the pair-update step's `Dense` calls.
+used for the pair-update step's `Dense` calls. Every LayerNorm below explicitly
+sets `dims=1`: Lux's default `dims=:` would normalize across tokens and batch
+members as well as features.
 """
 function apply_ln(ln, x::AbstractArray{T,3}) where {T}
     d, n, b_size = size(x)
@@ -195,11 +197,11 @@ function pairformer_block(cfg::ModelConfig)
     Lux.@compact(
         wq=Lux.Dense(d => d), wk=Lux.Dense(d => d), wv=Lux.Dense(d => d), wo=Lux.Dense(d => d),
         pair_bias=Lux.Dense(dp => n_heads),
-        ln_attn=Lux.LayerNorm((d,)),
+        ln_attn=Lux.LayerNorm((d,); dims=1),
         pair_a=Lux.Dense(d => dp), pair_b=Lux.Dense(d => dp), pair_mix=Lux.Dense(dp => dp, gelu),
-        ln_pair=Lux.LayerNorm((dp,)),
+        ln_pair=Lux.LayerNorm((dp,); dims=1),
         mlp1=Lux.Dense(d => dh, gelu), mlp2=Lux.Dense(dh => d),
-        ln_mlp=Lux.LayerNorm((d,)),
+        ln_mlp=Lux.LayerNorm((d,); dims=1),
         n_heads=n_heads,
     ) do szp
         s, z, pad_bias = szp
@@ -238,8 +240,8 @@ function dit_block(cfg::ModelConfig)
         pair_bias=Lux.Dense(cfg.d_pair => n_heads),
         ada1=Lux.Dense(cfg.d_time => 2d),  # time -> (scale, shift) for pre-attention norm
         ada2=Lux.Dense(cfg.d_time => 2d),  # time -> (scale, shift) for pre-MLP norm
-        ln1=Lux.LayerNorm((d,); affine=false),
-        ln2=Lux.LayerNorm((d,); affine=false),
+        ln1=Lux.LayerNorm((d,); affine=false, dims=1),
+        ln2=Lux.LayerNorm((d,); affine=false, dims=1),
         mlp1=Lux.Dense(d => dh, gelu), mlp2=Lux.Dense(dh => d),
         n_heads=n_heads,
     ) do sztp

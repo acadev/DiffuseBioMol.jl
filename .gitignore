@@ -4,3 +4,6 @@ Manifest.toml
 *.jl.mem
 .DS_Store
 .CondaPkg/
+runs/
+python/.venv/
+__pycache__/

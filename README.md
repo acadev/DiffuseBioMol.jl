@@ -234,6 +234,29 @@ CASP15 RNA / DockQ protein-complex accuracy against literature numbers.
 
 ## Development
 
+A runnable PyTorch training version lives in [`python/`](python/README.md).
+It reuses exported Julia tokens and provides flow-matching training, validation,
+checkpoint resume, stage timings and cross-framework numerical checks. The Julia
+implementation remains available as the reference.
+
+For a reproducible **training pipeline proof** on six local PDB/mmCIF sources:
+
+```sh
+julia --project=. scripts/verify_training_baseline.jl /path/to/six-structures runs/training-proof
+```
+
+Use a new output directory. This CPU check runs three epochs on small real
+crops, compares uninterrupted and checkpoint-resumed training, checks loss
+reduction on one fixed crop, and verifies finite sampling. It writes
+`evidence.toml` and per-step timing CSVs. It does not establish protein quality,
+GPU throughput, or full-protein generation. Set `training.profile_steps = true`
+in a baseline config to collect the same synchronized diagnostic timings.
+
+The current implemented objective/sampler is flow matching. A separate diffusion
+objective and sampler remain required future work; both are retained in the
+[scaling plan](docs/SCALING_CLEANUP_PLAN.md). The scale target is one billion
+crop/sample presentations, potentially revisiting sources.
+
 ```sh
 julia --project=. -e 'using Pkg; Pkg.test()'
 

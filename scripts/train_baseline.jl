@@ -48,13 +48,25 @@ import Wandb
 const Lux = DiffuseBioMol.Model.Network.Lux
 const CORPUS_CACHE_VERSION = 4
 const GPU_LAUNCH_REQUESTED = "--gpu" in ARGS && ! ("--prepare-only" in ARGS)
+const GPU_BACKEND = if GPU_LAUNCH_REQUESTED && Base.find_package("LuxCUDA") !== nothing
+    :cuda
+elseif GPU_LAUNCH_REQUESTED && Base.find_package("Metal") !== nothing
+    :metal
+else
+    :none
+end
 
 # Load optional GPU triggers at top level. Importing an extension inside a
 # compiled function creates a too-new global binding under Julia 1.12.
 if GPU_LAUNCH_REQUESTED
-    Base.find_package("LuxCUDA") === nothing && error("--gpu requires LuxCUDA.jl in the active Julia environment; run `julia --project=. -e 'using Pkg; Pkg.add(\"LuxCUDA\")'`")
-    @eval import CUDA
-    @eval using LuxCUDA
+    if GPU_BACKEND === :cuda
+        @eval import CUDA
+        @eval using LuxCUDA
+    elseif GPU_BACKEND === :metal
+        @eval using Metal
+    else
+        error("--gpu requires LuxCUDA.jl for NVIDIA or Metal.jl for Apple Silicon")
+    end
 end
 
 """Lightweight cached source: tokens only, with no O(N²) pair features."""
@@ -420,8 +432,10 @@ function infill_conditioning(ex::BaselineExample, fraction::Real, rng::AbstractR
 end
 
 function train_batch(model, ps, st, opt_state, batch, rng, device; infill_probability::Real=0.0,
-                     infill_fixed_fraction::Real=0.2)
+                     infill_fixed_fraction::Real=0.2, trace_stages::Bool=false, timings=nothing)
     0 <= infill_probability <= 1 || throw(ArgumentError("infill_probability must lie in [0, 1]"))
+    stage_start = time_ns()
+    trace_stages && println("first batch: assembling padded host tensors.")
     batched_feat = batch_features([ex.feat for ex in batch])
     relpos = batch_relpos([ex.relpos for ex in batch])
     conditioned = [rand(rng) < infill_probability ? infill_conditioning(ex, infill_fixed_fraction, rng) :
@@ -432,15 +446,47 @@ function train_batch(model, ps, st, opt_state, batch, rng, device; infill_probab
     is_fixed = reduce(hcat, [vcat(mask, falses(size(coords, 2) - length(mask))) for (_, mask, _) in conditioned])
     fixed_coord = batch_coords(last.(conditioned))
     example = prepare_training_example(batched_feat, coords, cond, rng; is_fixed, fixed_coord)
+    timings === nothing || (timings["host_prepare_s"] = (time_ns() - stage_start) / 1e9)
 
     # Sampling the prior/SE(3) augmentation is CPU-side and outside AD; only
     # the differentiable batch is moved to the selected single device.
+    trace_stages && println("first batch: transferring tensors to the selected device.")
+    stage_start = time_ns()
     batched_feat = to_device(batched_feat, device)
     relpos, pad_bias, example = device(relpos), device(pad_bias), to_device(example, device)
+    timings === nothing || synchronize_selected_gpu()
+    timings === nothing || (timings["transfer_s"] = (time_ns() - stage_start) / 1e9)
+    trace_stages && println("first batch: tensors ready on $(typeof(relpos)); running forward pass.")
+    stage_start = time_ns()
     loss, back = Zygote.pullback(p -> cfm_loss(model, p, st, batched_feat, relpos, pad_bias, example)[1], ps)
+    isfinite(loss) || error("non-finite training loss: $loss")
+    timings === nothing || synchronize_selected_gpu()
+    timings === nothing || (timings["forward_s"] = (time_ns() - stage_start) / 1e9)
+    trace_stages && println("first batch: forward pass complete; running reverse-mode gradient.")
+    stage_start = time_ns()
     grad = back(1.0f0)[1]
+    timings === nothing || synchronize_selected_gpu()
+    timings === nothing || (timings["backward_s"] = (time_ns() - stage_start) / 1e9)
+    stage_start = time_ns()
     opt_state, ps = Optimisers.update(opt_state, ps, grad)
+    timings === nothing || synchronize_selected_gpu()
+    timings === nothing || (timings["optimizer_s"] = (time_ns() - stage_start) / 1e9)
+    trace_stages && synchronize_selected_gpu()
+    trace_stages && println("first batch: gradient update complete.")
     ps, opt_state, Float64(loss)
+end
+
+"""Opt-in diagnostic timings; synchronization intentionally prevents overlap."""
+function append_step_profile(path, epoch, batch_number, batch, loss, crop_s, timings)
+    new_file = !isfile(path)
+    fields = ("host_prepare_s", "transfer_s", "forward_s", "backward_s", "optimizer_s")
+    open(path, "a") do io
+        new_file && println(io, "epoch,batch,structures,real_atoms,padded_atoms,loss,crop_s," * join(fields, ','))
+        real_atoms = sum(ex -> count(.!ex.feat.is_virtual), batch)
+        padded_atoms = length(batch) * maximum(n_atoms, batch)
+        println(io, join((epoch, batch_number, length(batch), real_atoms, padded_atoms, loss,
+            crop_s, (timings[field] for field in fields)...), ','))
+    end
 end
 
 function geometry_metrics(coords, ex::BaselineExample)
@@ -536,7 +582,8 @@ function append_metrics(path::AbstractString, epoch::Int, train_loss::Real, scop
 end
 
 """Assess final held-out samples against the matched prior from that same evaluation."""
-function gate_report(initial_reports, final_reports, min_rmsd_improvement::Real; initial_infill=nothing, final_infill=nothing)
+function gate_report(initial_reports, final_reports, min_rmsd_improvement::Real;
+                     initial_infill=nothing, final_infill=nothing, infill_required::Bool=false)
     # Every evaluation includes a matched prior sample. Comparing final model
     # samples to that prior avoids an expensive CPU-only epoch-zero model pass
     # and keeps the reconstruction comparison on the same held-out set.
@@ -545,8 +592,10 @@ function gate_report(initial_reports, final_reports, min_rmsd_improvement::Real;
     reconstruction = trained["mean_rmsd"] <= prior["mean_rmsd"] - min_rmsd_improvement
     beats_prior = all(trained[k] <= prior[k] for k in ("mean_rmsd", "mean_clashes", "mean_bond_rmsd", "mean_chirality_bad"))
     guidance_safe = all(guided[k] <= trained[k] for k in ("mean_clashes", "mean_bond_rmsd", "mean_chirality_bad"))
-    infill_pass = if initial_infill === nothing || final_infill === nothing
-        true
+    infill_requested = infill_required || initial_infill !== nothing || final_infill !== nothing
+    infill_evaluated = initial_infill !== nothing && final_infill !== nothing
+    infill_pass = if !infill_evaluated
+        false
     else
         aggregate_infill(final_infill)["mean_generated_rmsd"] <=
             aggregate_infill(initial_infill)["mean_generated_rmsd"] - min_rmsd_improvement
@@ -558,7 +607,9 @@ function gate_report(initial_reports, final_reports, min_rmsd_improvement::Real;
         "trained_beats_prior_on_all_metrics" => beats_prior,
         "guidance_non_regression" => guidance_safe,
         "infill_reconstruction_pass" => infill_pass,
-        "all_passed" => reconstruction && beats_prior && guidance_safe && infill_pass,
+        "infill_status" => !infill_requested ? "not_requested" :
+            !infill_evaluated ? "not_evaluated" : infill_pass ? "passed" : "failed",
+        "all_passed" => reconstruction && beats_prior && guidance_safe && (!infill_requested || infill_pass),
     )
 end
 
@@ -574,9 +625,28 @@ function selected_device(use_gpu::Bool)
     # LuxCUDA, rather than CUDA.jl alone, registers the CUDA device trigger
     # with MLDataDevices. Refuse CPU fallback when the caller requested --gpu.
     GPU_LAUNCH_REQUESTED || error("--gpu device selection requires launching this script with the --gpu flag")
-    CUDA.functional() || error("--gpu was requested, but CUDA.jl cannot use a functional GPU in this environment")
-    println("Using CUDA device: $(CUDA.name(CUDA.device()))")
-    Lux.gpu_device()
+    device = Lux.gpu_device()
+    probe = device(zeros(Float32, 1))
+    if GPU_BACKEND === :cuda
+        CUDA.functional() || error("--gpu was requested, but CUDA.jl cannot use a functional GPU in this environment")
+        CUDA.allowscalar(false)
+        probe isa CUDA.AbstractGPUArray || error("--gpu selected $(typeof(probe)) instead of a CUDA array")
+        CUDA.synchronize()
+        println("Using CUDA device: $(CUDA.name(CUDA.device()))")
+    elseif GPU_BACKEND === :metal
+        Metal.functional() || error("--gpu was requested, but Metal.jl cannot use this Mac GPU")
+        probe isa Metal.MtlArray || error("--gpu selected $(typeof(probe)) instead of a Metal array")
+        Metal.synchronize()
+        println("Using Metal device: $(Metal.device())")
+    end
+    println("GPU device transfer preflight passed ($(typeof(probe))).")
+    device
+end
+
+function synchronize_selected_gpu()
+    GPU_BACKEND === :cuda && return CUDA.synchronize()
+    GPU_BACKEND === :metal && return Metal.synchronize()
+    nothing
 end
 
 """Use a format-specific filename so an incompatible cache is never deserialized."""
@@ -598,10 +668,12 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
     crop_strategy = String(get(data, "crop_strategy", "mixed"))
     crop_strategy in ("sequence", "spatial", "mixed") || error("data.crop_strategy must be sequence, spatial, or mixed")
     Int(require_key(data, "max_atoms")) > 0 || error("data.max_atoms must be positive for baseline training")
+    corpus_started = time_ns()
     sources, skipped = load_corpus(String(require_key(data, "data_dir"));
         max_atoms=Int(require_key(data, "max_atoms")), cache_path,
         progress_every=Int(get(data, "load_progress_every", 25)),
         max_candidate_files=Int(get(data, "max_candidate_files", 0)), selection_seed=seed, oversize_policy)
+    @printf("Corpus load/cache time: %.3f s\n", (time_ns() - corpus_started) / 1e9)
     max_structures = Int(get(data, "max_structures", 0))
     if max_structures > 0 && length(sources) > max_structures
         sources = sort(sources; by = ex -> ex.source)[randperm(MersenneTwister(seed), length(sources))[1:max_structures]]
@@ -676,14 +748,20 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
             # Creating all crops up front would retain an O(N²) pair matrix for
             # every training source and can delay the first GPU batch for many
             # minutes. Keep only one materialized batch alive at a time.
+            crop_started = time_ns()
             batch = materialize_crop_batch(source_batch, max_atoms, crop_strategy, seed, epoch, batch_number)
+            crop_s = (time_ns() - crop_started) / 1e9
+            timings = Bool(get(training_cfg, "profile_steps", false)) ? Dict{String,Float64}() : nothing
             if batch_number == 1
                 println("epoch $epoch/$epochs: first crop batch ready; compiling/launching GPU training.")
             elseif batch_number % batch_progress_every == 0 || batch_number == length(source_batches)
                 println("epoch $epoch/$epochs: batch $batch_number/$(length(source_batches)).")
             end
             ps, opt_state, loss = train_batch(model, ps, st, opt_state, batch, rng, device;
-                infill_probability=Float64(get(training_cfg, "infill_probability", 0.0)), infill_fixed_fraction)
+                infill_probability=Float64(get(training_cfg, "infill_probability", 0.0)), infill_fixed_fraction,
+                trace_stages=batch_number == 1, timings)
+            timings === nothing || append_step_profile(joinpath(run_dir, "step_profile.csv"),
+                epoch, batch_number, batch, loss, crop_s, timings)
             push!(losses, loss)
         end
         train_loss = mean(losses)
@@ -708,7 +786,7 @@ function main(config_path::AbstractString, run_dir::AbstractString; resume::Bool
         end
     end
     gates = gate_report(initial_reports, final_reports, Float64(require_key(eval_cfg, "min_rmsd_improvement"));
-        initial_infill, final_infill=infill_enabled ? final_infill : nothing)
+        initial_infill, final_infill=infill_enabled ? final_infill : nothing, infill_required=infill_enabled)
     open(joinpath(run_dir, "gates.toml"), "w") do io
         TOML.print(io, gates)
     end

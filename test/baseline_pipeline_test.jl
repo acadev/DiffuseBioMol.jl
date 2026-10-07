@@ -111,9 +111,18 @@ include(joinpath(@__DIR__, "..", "scripts", "train_baseline.jl"))
         @test gates["trained_beats_prior_on_all_metrics"]
         @test gates["guidance_non_regression"]
         @test gates["all_passed"]
+        @test gates["infill_status"] == "not_requested"
+        @test !gates["infill_reconstruction_pass"]
         infill_initial = [(label="x", n_atoms=9, fixed_atoms=2, generated_atoms=7, generated_rmsd=10.0, fixed_rmsd=0.0)]
         infill_final = [(label="x", n_atoms=9, fixed_atoms=2, generated_atoms=7, generated_rmsd=8.0, fixed_rmsd=0.0)]
         infill_gates = gate_report(initial, final, 0.1; initial_infill=infill_initial, final_infill=infill_final)
         @test infill_gates["infill_reconstruction_pass"]
+        @test infill_gates["infill_status"] == "passed"
+        missing_reference = gate_report(initial, final, 0.1; final_infill=infill_final)
+        @test missing_reference["infill_status"] == "not_evaluated"
+        @test !missing_reference["all_passed"]
+        required_missing = gate_report(initial, final, 0.1; infill_required=true)
+        @test required_missing["infill_status"] == "not_evaluated"
+        @test !required_missing["all_passed"]
     end
 end

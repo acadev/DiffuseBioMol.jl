@@ -31,6 +31,10 @@ end
     model = build_model(cfg)
     ps, st = Lux.setup(rng, model)
 
+    # A zero-initialized output head makes every output zero and hides leakage
+    # across atom/batch dimensions (e.g. LayerNorm with default dims=:).
+    ps.head.weight .= 0.1f0 .* randn(rng, Float32, size(ps.head.weight))
+
     ex_small = tiny_example(3, 11)
     ex_large = tiny_example(5, 22)
     t_val = 0.37f0
