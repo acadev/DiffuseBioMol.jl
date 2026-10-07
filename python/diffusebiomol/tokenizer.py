@@ -1,7 +1,7 @@
 """AtomWorks structures to versioned, atom-level training records.
 
 Canonical polymer slots and embedding IDs are frozen in vocabulary.json.
-No Julia runtime, generated coordinates, or external CCD mirror is required.
+No generated coordinates or external CCD mirror is required.
 """
 import json
 from pathlib import Path

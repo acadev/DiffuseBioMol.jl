@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diffusebiomol"
+version = "0.1.0"
+description = "Native Python all-atom biomolecular flow matching with AtomWorks and PyTorch"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "torch==2.14.0",
+    "numpy==2.5.3",
+    "atomworks==3.0.0",
+]
+
+[project.scripts]
+diffusebiomol-prepare = "diffusebiomol.prepare_corpus:main"
+diffusebiomol-train = "diffusebiomol.train:main"
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["diffusebiomol*"]
+
+[tool.setuptools.package-data]
+diffusebiomol = ["vocabulary.json"]

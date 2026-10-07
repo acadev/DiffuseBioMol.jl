@@ -1,1 +1,1 @@
-"""PyTorch training implementation of the Julia flow-matching baseline."""
+"""Native Python biomolecular flow matching with AtomWorks and PyTorch."""

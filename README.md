@@ -1,435 +1,78 @@
 # DiffuseBioMol
 
-Active development is in **[the Python implementation](python/README.md)**.
-PDB/mmCIF parsing and tokenization use AtomWorks; preparation and PyTorch training
-run without Julia.
+A native Python project for all-atom biomolecular flow matching, using
+AtomWorks for structure parsing and PyTorch for modeling and training.
+
+## Install
+
+Run from the repository root with Python 3.12:
 
 ```sh
-python3.12 -m venv python/.venv
-python/.venv/bin/python -m pip install -r python/requirements.txt
-PYTHONPATH=python python/.venv/bin/python -m diffusebiomol.prepare_corpus /path/to/structures runs/corpus
-PYTHONPATH=python python/.venv/bin/python -m diffusebiomol.train runs/corpus runs/experiment
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
 ```
 
-Use new output directories. The current Python scope is single-device,
-unconditional flow matching; see its README for validation and limitations.
-The following sections describe the historical Julia implementation and roadmap.
+Dependency versions and command-line entry points are defined in `pyproject.toml`.
+An existing Python environment can be reused with `python -m pip install -e .`.
 
-## Historical Julia implementation
-
-A Julia-native, all-atom biomolecular diffusion/flow model combining
-[RFdiffusion3](https://github.com/RosettaCommons/foundry)'s conditioning/design
-flexibility with [NeuralPLexer3](https://github.com/zrqiao/NeuralPLexer)'s
-any-to-any co-folding generality — with physical correctness as an in-loop,
-differentiable signal rather than a post-hoc filter, and a closed-loop
-generate → verify → curate → retrain controller for continuous self-improvement.
-
-**Provenance note**: this is a from-scratch Julia implementation *inspired by*
-the published architectural descriptions of RFdiffusion3 and NeuralPLexer3
-(papers/preprints/blog posts) — not a port of, or built against, their actual
-source code. Neither codebase was available to reference directly while
-building this. See `docs/PLAN.md`'s research summaries for what's confirmed
-from primary sources vs. inferred.
-
-Full design rationale, literature review, and phased roadmap:
-[`docs/PLAN.md`](docs/PLAN.md).
-
-## Status
-
-Phases 0-3 are implemented and tested (see `test/` — unit tests with
-hand-computed expected values, plus a dedicated `regression_test.jl` pinning
-exact golden values for deterministic components):
-
-- **Phase 0** (`src/Tokenization/`, `src/Data/`): a unified any-modality atom
-  tokenizer — protein, RNA, DNA, ligand, and ion residues all become the same
-  `AtomToken` representation, with fixed-slot padding for polymer residues and
-  atom-by-atom tokenization for non-polymer ones — plus a PDB/mmCIF parser
-  (via BioStructures.jl) producing the `ParsedResidue` records the tokenizer
-  consumes, a `Data.fetch_pdb` helper for pulling real structures straight
-  from the RCSB, and `Data.from_atom_array` — an adapter for data shaped like
-  [AtomWorks](https://github.com/RosettaCommons/atomworks)/Biotite's
-  `AtomArray` (the data layer RFdiffusion3/foundry trains against). This is
-  *not* a Python bridge (this codebase has no Python dependency) — it's the
-  Julia-side conversion logic for that data shape; see the function's
-  docstring for the actual PythonCall.jl recipe to use it with a real
-  `AtomArray`, which isn't exercised in this repo's test suite since it
-  requires a Python environment with `atomworks`/`biotite` installed.
-- **Phase 1** (`src/Model/`, `src/Sampling/`): a Pairformer-lite encoder
-  (multi-head attention with a per-head pair-representation bias, no triangle
-  attention, per RFdiffusion3's finding that this is sufficient) feeding a
-  DiT-style decoder (time-conditioned, adaptive-layernorm multi-head
-  attention blocks) that predicts a flow-matching velocity field; a
-  physics-informed Langevin-polymer prior (`Sampling.Prior`, following
-  NeuralPLexer3) replacing pure Gaussian noise at `t=0`; and a
-  conditional-flow-matching training loss + Euler sampler
-  (`Sampling.FlowMatching`). Validated both on synthetic fixtures (the
-  network fits a single example to <20% of its initial loss) and on real PDB
-  structures (`scripts/train_phase1_real_data.jl` trains across 1CRN/1UBQ/5PTI
-  fetched live from the RCSB, 326-648 atoms each, with no errors and a finite,
-  correctly-shaped sampled output).
-- **Phase 2** (`src/Model/Conditioning.jl`): a generalized constraint-token
-  system generalizing RFdiffusion3's design vocabulary onto the same backbone
-  — `is_fixed` atoms (motif/hotspot scaffolding) are clamped exactly at every
-  sampling step and excluded from the training loss; `is_hotspot`/
-  `rasa_target` are soft conditioning subject to classifier-free-guidance
-  dual-pass dropout (`Sampling.FlowMatching.sample_flow`'s
-  `cond_features_uncond`/`guidance_scale`); `ChainCoMConstraint` is a
-  closed-form sampling-time guidance potential for center-of-mass targeting.
-- **Phase 3** (`src/Verification/`): the three-layer physical-correctness
-  stack's first two layers. `Geometry` is pure, dependency-free, Zygote-
-  differentiable coordinate math — clash energy (VDW-radius-based repulsion,
-  excluding covalently-local atom pairs), bond-length energy (harmonic
-  restraint against `backbone_bonds`' derived ideal-length pairs), chirality
-  energy (a normalized, scale-invariant CA-stereocenter handedness term —
-  `chiral_centers` derives `(CA, N, C, CB)` quadruples per residue, the
-  correct-handedness sign/range was confirmed empirically against 164 real
-  CA centers from 1CRN/1UBQ/5PTI rather than assumed from memory, and the
-  term is normalized by substituent-vector length specifically so its
-  gradient stays bounded and doesn't blow up sampling trajectories that
-  start far from realistic molecular scale), and per-atom lDDT (the real
-  AlphaFold-style local distance difference test, used as a self-supervised
-  confidence label). `validity_guidance_step` turns `Geometry.validity_energy`'s
-  negative gradient (clash + bond + chirality, jointly weighted) into a
-  sampling-time correction, pluggable directly into `sample_flow`'s
-  `post_step` hook — no changes to `Sampling.FlowMatching`'s API were
-  needed. `Verifier` is a small, self-contained network (deliberately not
-  sharing code with `Model.Network`, mirroring how `Sampling` stays
-  decoupled from `Model`) predicting per-atom confidence + clash likelihood,
-  trained against `Geometry`-derived labels without needing external tools.
-  Layer 3 (MolProbity/OpenMM relaxation/self-consistency refold) is still
-  unimplemented — it's the one layer that will need a Python interop story.
-
-v1 simplifications worth knowing about (documented in the relevant module
-docstrings, not hidden): a pair representation that's built by the encoder
-but not further updated by the decoder; the closed-vocabulary atom-identity
-embedding only applies to polymer atoms (ligand/ion/PTM atoms are typed by
-element + modality only); the flow-matching path is plain linear
-interpolation, not yet NeuralPLexer3's optimal-transport permutation +
-timestep shifting; symmetry conditioning (RFD3's pre-symmetrized noise for
-Cn-symmetric design) and a richer motif vocabulary (unindexed motifs, H-bond
-donor/acceptor typing) are not yet implemented; `backbone_bonds`/bond-length
-and chirality guidance only cover protein backbone geometry (RNA/DNA are
-future work); and `Verification.Verifier` (the learned verifier head) is not
-yet batched (only the main flow-matching model is, see below) since it
-wasn't in this round's scope, and doesn't yet predict a chirality/clash
-signal specifically informed by the new `Geometry.chirality_energy` term
-(still only confidence + clash logits).
-
-Everything else (`AgenticLoop`, `Distributed`, Layer 3 external verification)
-is a documented stub module — see each module's docstring for what it's
-responsible for and which roadmap phase it belongs to.
-
-## Training pipeline / compute
-
-CPU is fine for tests; real training needs GPU, and that surfaced a real bug.
-Benchmarking a "modest production" config (2.5M params, 10 layers) found a
-severe Zygote compile-time pathology — first backward-pass compile took
-**47 minutes** at that scale. Root causes and fixes (both shipped, see
-`docs/PLAN.md`'s training-pipeline section for the full diagnosis with
-numbers):
-
-1. Multi-head attention was a Julia-level loop over heads + `vcat` — fixed
-   with a single batched `NNlib.batched_mul` (verified bit-identical output).
-2. The encoder/decoder composed repeated blocks as a `Vector` iterated in a
-   runtime loop inside one `Lux.@compact` — fixed by giving each block its
-   own `Lux.@compact` layer and composing via `Lux.Chain`. Zygote handles
-   `Lux.Chain`'s compile-time-recursive composition far better than a
-   homogeneous-`Vector`-at-runtime loop, especially as width and depth grow
-   *together* (neither alone was catastrophic; combined, it was).
-
-Net result on the same config: **2822s → 80s first-compile, 514s → 1.16s/iter
-steady-state.** This is now the standing rule for this codebase: never
-compose repeated sub-layers as a `Vector` looped over inside `@compact` —
-always `Lux.Chain` of standalone block layers.
-
-**Hardware**: nothing here is NVIDIA-specific (no GPU code exists yet), but
-the practical reality is that CUDA.jl is the only Julia GPU backend mature
-enough for this today. Aurora's Intel GPUs (oneAPI.jl) aren't there yet —
-Lux.jl labels that backend "experimental" with no confirmed NN-training track
-record; AMDGPU.jl is more mature but Lux's own team recommends Reactant.jl
-over it for production non-NVIDIA work, and Reactant's Intel/SYCL path is
-unproven. **Near-term target: ALCF's Polaris (NVIDIA A100s, documented Julia+CUDA.jl support).** Aurora is a Reactant.jl R&D spike for later, not a
-blocker.
-
-**Sequencing decision**: cross-structure batching before CUDA.jl device
-support, before Phase 4 — now executed (see below), gates passed.
-
-### Batching (shipped)
-
-`src/Model/Batching.jl`: every tensor through `Model.Network` now carries a
-trailing batch dimension `B` (`s` is `d_single x N x B`, `z` is
-`d_pair x N x N x B`, etc.). Padded atoms (from structures of different
-length stacked into one batch) are masked out of attention via an additive
-`pad_bias`, threaded through the `Lux.Chain` alongside `z`/`t_emb` — no other
-op needed explicit masking (`Dense`/`LayerNorm` are per-atom; the only other
-cross-atom op, the Pairformer's pair-update, can't leak padded garbage into
-real atoms because the attention mask already overrides it where it'd
-matter). The original single-structure API (`TrainingExample`,
-`cfm_loss(model, ps, st, feat::TokenFeatures, ...)`, etc.) is **unchanged in
-external behavior** — it auto-wraps to `B=1` internally — so nothing existing
-broke; `BatchedTrainingExample` + the `BatchedFeatures`-based overloads are
-the new `B>1` path.
-
-One real bug found: `Lux.LayerNorm` expects 2D `(features, batch)` input,
-not 3D `(d, N, B)` — fixed with a flatten/apply/restore wrapper (`apply_ln`),
-same pattern already used for the pair-update step's `Dense` calls.
-
-**Gate passed**: real atoms produce bit-identical output whether computed
-alone or padded inside a batch (`test/batching_test.jl`); atoms/sec scales
-clearly with batch size on CPU (1CRN, toy 77K-param config):
-
-| Batch size | atoms/sec |
-|---|---|
-| 1 | 446-455 |
-| 4 | 2695-2754 |
-| 8 | 3267 |
-| 16 | 3435 |
-
-### CUDA.jl device support (shipped, not yet run on real GPU hardware)
-
-Deliberately **zero new dependencies**: `Lux.gpu_device()`/`cpu_device()`
-already ship with Lux and gracefully fall back to CPU when no GPU trigger
-package (`CUDA.jl`/`AMDGPU.jl`/etc.) is loaded — confirmed directly in this
-sandbox (no GPU here). `BatchedFeatures`/`BatchedTrainingExample` were made
-parametric over their array types so they transparently hold either CPU or
-GPU arrays; `Model.Batching.to_device` explicitly converts mask fields from
-packed `BitMatrix` to dense `Array{Bool}` first (packed-bit storage has no
-efficient GPU representation). `Verification.Geometry`'s `O(N²)` scalar-loop
-clash/bond/lDDT checks were deliberately **not** ported to GPU — they only
-run at sampling time, not the hot training loop, so the right move is
-transferring the small sampled-coordinate array back to CPU first, not
-vectorizing the loops.
-
-### Polaris / H100 numbers — handoff (needs real hardware this session doesn't have)
-
-```julia
-using CUDA  # or AMDGPU, etc., whatever the node has
-import DiffuseBioMol.Model.Network.Lux as Lux
-include("scripts/benchmark_throughput.jl")
-run_batch_size_sweep(device = Lux.gpu_device())
-```
-Run identically on a Polaris A100 node and the H100 cluster node; compare
-measured atoms/sec and the H100:A100 ratio against ~1.9-2.6x (MLPerf
-Training v2.1's BF16 range — not the 3.5x peak-FLOPS ratio or NVIDIA's
-marketed up-to-9x figures, which need FP8/Transformer Engine paths current
-Julia tooling doesn't expose). See `docs/PLAN.md` for the full hardware
-research this expectation is based on.
-
-## Benchmarking
-
-`scripts/benchmark_validity.jl` is the Stage A benchmark — runnable today,
-zero new dependencies, zero GPU. It does *not* reach for literature-standard
-benchmarks (PoseBusters, CASP15, DockQ): those need either a meaningfully-
-trained model or external tool bridging, both premature before batching/GPU
-training exists. Instead it checks the thing `docs/PLAN.md` originally
-specified as the Phase 1 gate — does the model produce physically sane
-geometry on held-out real structures, and is it better than no learning at
-all — using only this codebase's own `Geometry` machinery (`clash_count`,
-`bond_length_rmsd`, `chirality_count`). Four conditions per held-out
-structure (`1L2Y`/`1VII`/`2GB1`, disjoint from the training set
-`1CRN`/`1UBQ`/`5PTI`): a raw prior sample (zero learning, the floor), an
-untrained model's `sample_flow` output (isolates architecture/guidance
-effects from learning), a briefly-trained model, and that same trained
-model with `validity_guidance_step` (clash + bond + chirality) applied —
-this last comparison is the Phase 3 guidance gate: on the same model/seed,
-guided should match or beat unguided on all three metrics, since guidance is
-added at sampling time only. This is the number to track as training scales
-up — not a finished evaluation. Once there's a real trained model at
-meaningful scale, the next benchmarking rungs are: self-consistency/
-designability checks (RFD3-style, need an external refold tool), then
-CASP15 RNA / DockQ protein-complex accuracy against literature numbers.
-
-## Roadmap
-
-0. ✅ Core data & unified any-modality tokenization (+ AtomWorks-shaped data adapter)
-1. ✅ Pairformer-lite + DiT backbone, SE(3) flow matching with a physics-informed prior (hardened: multi-head attention, real-PDB training)
-2. ✅ Generalized constraint-token conditioning system (hotspot/motif/RASA/CoM; symmetry deferred)
-3. ✅ Differentiable physical-validity guidance (clash + bond-length + chirality) + learned verifier head (confidence + clash); Layer 3 external verification still open
-4. Consistency-distilled fast sampler
-5. Agentic generate→verify→curate→retrain loop
-6. Multi-node distributed training (MPI.jl)
-
-## Development
-
-A runnable PyTorch training version lives in [`python/`](python/README.md).
-It uses native AtomWorks parsing/tokenization and provides flow-matching training, validation,
-checkpoint resume, stage timings and cross-framework numerical checks. The Julia
-implementation remains available as the reference.
-
-For a reproducible **training pipeline proof** on six local PDB/mmCIF sources:
+## Prepare and train
 
 ```sh
-julia --project=. scripts/verify_training_baseline.jl /path/to/six-structures runs/training-proof
+# Parse local PDB/mmCIF files into a new corpus directory.
+diffusebiomol-prepare /path/to/structures runs/corpus
+
+# Train on residue-complete crops; use a new run directory.
+diffusebiomol-train runs/corpus runs/experiment --epochs 10 --max-atoms 128 --batch-size 2
+
+# Continue the same experiment.
+diffusebiomol-train runs/corpus runs/experiment --epochs 20 --max-atoms 128 --batch-size 2 --resume
 ```
 
-Use a new output directory. This CPU check runs three epochs on small real
-crops, compares uninterrupted and checkpoint-resumed training, checks loss
-reduction on one fixed crop, and verifies finite sampling. It writes
-`evidence.toml` and per-step timing CSVs. It does not establish protein quality,
-GPU throughput, or full-protein generation. Set `training.profile_steps = true`
-in a baseline config to collect the same synchronized diagnostic timings.
+The equivalent module commands are `python -m diffusebiomol.prepare_corpus` and
+`python -m diffusebiomol.train`. No `PYTHONPATH` setup is needed after installation.
+Use `--help` for options and [the workflow guide](python/README.md) for parsing
+policies, configuration, outputs, and checkpoint compatibility.
 
-The current implemented objective/sampler is flow matching. A separate diffusion
-objective and sampler remain required future work; both are retained in the
-[scaling plan](docs/SCALING_CLEANUP_PLAN.md). The scale target is one billion
-crop/sample presentations, potentially revisiting sources.
+## Current capabilities
+
+- PDB/mmCIF and gzip parsing with AtomWorks; versioned atom tokenization for
+  proteins, RNA, DNA, ligands, ions, and modified residues.
+- Pairformer-lite/DiT backbone, linear-path flow-matching objective, polymer
+  prior, rotation/centering augmentation, and Euler sampling.
+- Single-device FP32 training, source-disjoint validation, checksummed corpora,
+  exact tested CPU checkpoint resume, and diagnostic stage timings.
+- CPU, CUDA, and MPS device selection. CPU is validated; accelerator training
+  and throughput still require validation on target hardware.
+
+The current runner trains unconditional crops. Diffusion, motif clamping,
+classifier-free guidance, geometry guidance, verifier training, distributed
+training, and full-structure generation are future work. Tokenizer support for
+multiple modalities does not establish generation quality for those modalities.
+Dense pair features still require quadratic memory.
+
+## Test
 
 ```sh
-julia --project=. -e 'using Pkg; Pkg.test()'
-
-# Reproducible single-device baseline (copy and edit configs/baseline.toml
-# to point data.data_dir at a local PDB/mmCIF corpus):
-julia --project=. scripts/train_baseline.jl configs/baseline.toml runs/baseline
-# Resume exactly from the latest model/optimizer/RNG checkpoint:
-julia --project=. scripts/train_baseline.jl configs/baseline.toml runs/baseline --resume
-# Optional, with CUDA.jl installed in the active Julia environment:
-julia --project=. scripts/train_baseline.jl configs/baseline.toml runs/baseline --gpu
-
-# H100 10k-structure profile (requires LuxCUDA.jl, which registers Lux's CUDA device):
-julia --project=. -e 'using Pkg; Pkg.add("LuxCUDA")'
-# Copy configs/h100_10k.toml, set data.data_dir, then launch:
-julia --project=. scripts/train_baseline.jl configs/h100_10k.toml runs/h100-10k --gpu
-
-### Large-corpus loading
-
-The baseline runner parses and tokenizes each coordinate file once, then writes
-the lightweight source tokens and coordinates to `corpus_cache.v4.jls` under
-the run directory. A restart reuses it without re-parsing. Pairwise tensors,
-coordinates in model layout, and geometry metadata are built only after a
-bounded crop is selected; they are never serialized for an uncropped protein.
-For the same curated corpus across multiple experiments, set
-`data.cache_path` to one absolute path on shared scratch storage (for example,
-`/scratch/diffusebiomol/pdb10k-max1200.jls`). The cache is accepted only when
-the selected source paths, sizes, modification times, atom cap, and candidate
-selection settings exactly match; it otherwise rebuilds rather than using stale
-structures. `data.load_progress_every` controls periodic parse-progress messages
-(default: 25 files).
-
-When `data_dir` is a large mirror, set `data.max_candidate_files` before the
-first build. The runner deterministically samples that many filenames using the
-training seed *before* parsing, rather than parsing an entire mirror only to
-discard most examples later. The 10k H100 profile uses 12,000 candidates to
-leave room for invalid or over-budget entries; use a curated corpus with at
-least 10,000 valid structures for that profile.
-
-The first build remains CPU-bound because every mmCIF must be parsed once;
-schedule it before occupying an H100 allocation when possible. Later training
-and resumed runs incur only lightweight cache deserialization. Cache format v4
-is required for crop-aware training and has its own filename. This deliberately
-leaves a legacy `corpus_cache.jls` untouched, so it is never opened or
-deserialized; remove that old file manually after you have verified the new
-cache.
-
-### Rich-corpus crop training
-
-For a crop-aware run, curate with `--max-atoms=0` to retain complete large
-protein chains, then use `oversize_policy = "crop"` and a positive
-`max_atoms` training budget. The trainer splits sources before cropping, draws
-one new residue-complete crop per oversized training source per epoch, and
-uses fixed held-out crops for comparable validation. `crop_strategy = "mixed"`
-alternates contiguous sequence windows and spatial residue neighborhoods;
-individual atoms are never sampled independently.
-
-```sh
-JULIA_NUM_THREADS=16 julia --project=. scripts/curate_protein_dataset.jl \
-  /data/pdb-raw /data/pdb-rich \
-  --n-structures=50000 --max-atoms=0 --min-residues=40 --seed=20260909 \
-  --concurrency=16
+python -m unittest discover -s python/tests -v
+# Optional real-data learning and resume checks:
+DBM_CORPUS=runs/corpus python -m unittest discover -s python/tests -v
 ```
 
-This improves local-geometry coverage, but it does not turn crops into new
-experimental conformations or enable stitched full-protein generation. Keep
-all crops from a source in one split (the runner does this), and use a
-sequence-clustered holdout when comparing against externally clustered data.
+[Baseline evidence](docs/BASELINE.md) describes the six-source CPU validation.
+The [scaling plan](docs/SCALING_CLEANUP_PLAN.md) separates current functionality
+from the remaining scientific and engineering work. GitHub Actions runs the
+Python tests and command-line smoke checks.
 
-Build the cache without initializing CUDA, W&B, or training:
+## Layout
 
-```sh
-julia --project=. scripts/train_baseline.jl configs/h100_10k.toml runs/h100-10k --prepare-only
+```text
+pyproject.toml              Package metadata, dependencies, and CLI commands
+python/diffusebiomol/        Parser, tokenizer, corpus, model, objective, trainer
+python/tests/               Offline parser and training regression tests
+python/configs/small.json    Example larger backbone configuration
+docs/                       Baseline evidence and roadmap
 ```
 
-### Weights & Biases
-
-The baseline runner logs local CSV/TOML artifacts by default. To mirror a run
-to W&B, set `[wandb].enabled = true`, choose its project/entity/name in the
-same config, and provide the API key only through the job environment:
-
-```sh
-export WANDB_API_KEY='...'
-julia --project=. scripts/train_baseline.jl configs/h100_10k.toml runs/h100-10k --gpu
-```
-
-It records CFM loss, sentinel/full validation aggregates (RMSD, clashes,
-bond RMSD, chirality violations), held-out motif-infill recovery, final gate
-outcomes, the config, manifest, metrics CSV, and checkpoints. No W&B client is initialized when
-`enabled = false`.
-
-### Motif infill evaluation
-
-The H100 profile trains 25% of batches with a contiguous observed residue
-motif clamped as a hard condition. It evaluates a fixed held-out set of 16
-crops by clamping 20% of each crop and reporting recovery RMSD on the remaining
-real atoms in `infill_metrics.csv` and W&B. Fixed-coordinate RMSD is logged as
-a correctness check and should remain numerically zero. The final gate includes
-whether held-out infill recovery improves over epoch zero.
-
-### Constructing a local protein baseline corpus
-
-Stage raw PDB/mmCIF candidates locally, then curate a deterministic,
-largest-chain, standard-protein dataset before training. The curation script
-requires complete backbone coverage and writes source provenance plus FASTA
-sequences for external homology clustering:
-
-```sh
-JULIA_NUM_THREADS=16 julia --project=. scripts/curate_protein_dataset.jl /data/pdb-raw /data/pdb10k-candidates \
-  --n-structures=12000 --max-atoms=1200 --min-residues=40 --seed=20260909 --concurrency=16
-```
-
-`--concurrency` parallelizes only independent coordinate-file inspection
-(reading, parsing, and tokenizing). Set `JULIA_NUM_THREADS` to at least the
-same value. Sampling, provenance, FASTA generation, and copies remain ordered
-and deterministic.
-
-Use `sequences.fasta` to select one representative per sequence cluster (for
-example, 30% identity). Feed the representative FASTA back into the same
-script to materialize only cluster representatives in the final 10k directory:
-
-```sh
-julia --project=. scripts/curate_protein_dataset.jl /data/pdb10k-candidates /data/pdb10k-final \
-  --n-structures=10000 --max-atoms=1200 --min-residues=40 --seed=20260909 \
-  --representatives-fasta=/data/mmseqs/cluster_rep_seq.fasta
-```
-
-Point `configs/h100_10k.toml`'s `data.data_dir` at that final directory.
-
-### Downloading a random RCSB candidate cache
-
-To construct a raw candidate cache directly from RCSB PDB, download a seeded
-sample of experimental protein entries in mmCIF form. The script saves its exact
-selection and resumes from valid cached files on the next invocation:
-
-```sh
-JULIA_NUM_THREADS=8 julia --project=. scripts/download_rcsb_dataset.jl /data/rcsb-raw \
-  --n-structures=15000 --seed=20260909 --retries=3 --concurrency=8
-```
-
-`--concurrency` bounds simultaneous HTTP downloads while retaining a
-deterministic sampled-ID list and manifest. Start with 8 workers (rather than
-an unbounded fan-out), and set `JULIA_NUM_THREADS` to at least that value so
-the workers have parallel execution capacity. Rerun the same command after interruption: valid
-cached mmCIF files are skipped and only missing/failed IDs are retried.
-
-Then use `/data/rcsb-raw` as the input to `curate_protein_dataset.jl`. Keep
-the generated `sampled_ids.txt` and `download_manifest.toml` with the run for
-reproducibility.
-
-# Real-PDB Phase 1 training smoke test (needs network access to RCSB):
-julia --project=. scripts/train_phase1_real_data.jl
-
-# Correctness benchmark (Stage A):
-julia --project=. scripts/benchmark_validity.jl
-
-# Performance benchmark (CPU baseline + batch-size sweep; add device=Lux.gpu_device()
-# after `using CUDA` for a real GPU run):
-julia --project=. scripts/benchmark_throughput.jl
-```
+The versioned vocabulary is bundled in the installable package. Datasets,
+checkpoints, and run outputs belong under ignored `runs/` directories.
