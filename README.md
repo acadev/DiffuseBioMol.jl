@@ -1,4 +1,21 @@
-# DiffuseBioMol.jl
+# DiffuseBioMol
+
+Active development is in **[the Python implementation](python/README.md)**.
+PDB/mmCIF parsing and tokenization use AtomWorks; preparation and PyTorch training
+run without Julia.
+
+```sh
+python3.12 -m venv python/.venv
+python/.venv/bin/python -m pip install -r python/requirements.txt
+PYTHONPATH=python python/.venv/bin/python -m diffusebiomol.prepare_corpus /path/to/structures runs/corpus
+PYTHONPATH=python python/.venv/bin/python -m diffusebiomol.train runs/corpus runs/experiment
+```
+
+Use new output directories. The current Python scope is single-device,
+unconditional flow matching; see its README for validation and limitations.
+The following sections describe the historical Julia implementation and roadmap.
+
+## Historical Julia implementation
 
 A Julia-native, all-atom biomolecular diffusion/flow model combining
 [RFdiffusion3](https://github.com/RosettaCommons/foundry)'s conditioning/design
@@ -235,7 +252,7 @@ CASP15 RNA / DockQ protein-complex accuracy against literature numbers.
 ## Development
 
 A runnable PyTorch training version lives in [`python/`](python/README.md).
-It reuses exported Julia tokens and provides flow-matching training, validation,
+It uses native AtomWorks parsing/tokenization and provides flow-matching training, validation,
 checkpoint resume, stage timings and cross-framework numerical checks. The Julia
 implementation remains available as the reference.
 
